@@ -1,6 +1,6 @@
 [submodule "src/ckernels/sfpi"]
 	path = tt_metal/third_party/sfpi
-	url = git@github.com:tenstorrent-metal/sfpi-rel.git
+	url = ../sfpi-rel.git
 
 [submodule "third_party/pybind11"]
 	path = tt_metal/third_party/pybind11
@@ -8,13 +8,13 @@
 
 [submodule "third_party/lfs"]
 	path = tt_metal/third_party/lfs
-	url = git@github.com:tenstorrent-metal/lfs.git
+	url = ../lfs.git
 [submodule "tt_metal/third_party/taskflow"]
 	path = tt_metal/third_party/taskflow
 	url = https://github.com/taskflow/taskflow
 [submodule "tt_metal/third_party/tracy"]
 	path = tt_metal/third_party/tracy
-	url = git@github.com:tenstorrent-metal/tracy.git
+	url = ../tracy.git
 [submodule "tt_metal/third_party/umd"]
 	path = tt_metal/third_party/umd
-	url = git@github.com:tenstorrent-metal/umd.git
+	url = ../umd.git
