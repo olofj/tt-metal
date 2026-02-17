@@ -10,5 +10,5 @@ pytest_suite(
         "@pip//loguru",
         "@pip//pandas",
     ],
-    tags = ["tt_metal", "profiler"],
+    tags = ["tt_metal", "profiler", "requires_wormhole_b0"],
 )
