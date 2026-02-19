@@ -12,7 +12,6 @@
 #include <tt-logger/tt-logger.hpp>
 #include <umd/device/types/cluster_descriptor_types.hpp>
 #include <umd/device/types/xy_pair.hpp>
-#include "tt_metal/third_party/umd/device/api/umd/device/types/xy_pair.hpp"
 
 namespace tt::tt_metal {
 
