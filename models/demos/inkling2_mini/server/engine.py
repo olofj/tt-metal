@@ -5,16 +5,19 @@
 exit when the driver's chip lock is released by a thread that does not own it).
 
 A runner does the device work, one token per step:
-    reset()              forget the sequence (conv histories; the KV caches are position-masked)
-    feed(token, pos)     run one decode step (may return before the device is done)
-    read_token() -> int  argmax of the last step
-    read_logits()        fp32 host logits [vocab] of the last step
+    reset()               forget the sequence (conv histories; the KV caches are position-masked)
+    feed(token, pos)      run one decode step on `token` (returns before the device is done)
+    feed_next(pos)        run one decode step on the argmax of the step at pos - 1, without reading it first
+    token_at(pos) -> int  argmax of the step at pos
+    read_logits()         fp32 host logits [vocab] of the last step run
     max_ctx
 `TTRunner` is the Inkling2 traced decode (tt/generator.py); the tests use a stub.
 
-KV reuse: the engine keeps the token ids it has fed (`fed`). A request whose prompt starts with all of them feeds
-only the rest; any other prompt resets and feeds from position 0. The decode state can not be rolled back (the short
-conv histories hold the last positions), so a prompt that diverges inside `fed` costs a full prefill.
+Greedy decode runs one step ahead: the step on token t is queued before the host has read t, so the card goes from
+step to step while the host reads the last token and turns it into text. A queued step is never taken back (the k/v
+conv window is a shift register: a step can not be undone), so its token always counts as fed. When the reply ends on
+a stop token, that token is fed: the next turn's prompt has it right after the reply (the template closes each model
+turn with it), so the reuse below still holds.
 """
 
 from __future__ import annotations
@@ -29,7 +32,13 @@ from models.demos.inkling2_mini.server.chat import OutputParser
 
 
 class TTRunner:
-    """Inkling2Model + Generator on the card: prefill = traced decode token by token, then traced decode."""
+    """Inkling2Model + Generator on the card: prefill = traced decode token by token, then traced decode.
+
+    The step's input token is the head's argmax buffer itself (model.tokens is a view of it), so a replay with no
+    token write runs on the argmax of the replay before it (feed_next); feed() writes the host's token over it. Each
+    step also queues a 4-byte read of its argmax (two host slots, one per step in flight). Sampled steps read the
+    logits through a small tail trace that turns the head's TILE logits into one fp32 row (800 KB instead of the
+    25 MB padded TILE tensor)."""
 
     def __init__(self, cache, max_ctx, trace_mib=512, log=print):
         import ttnn
@@ -40,30 +49,124 @@ class TTRunner:
         self.ttnn, self.vocab, self.max_ctx = ttnn, VOCAB_REAL, max_ctx
         t0 = time.time()
         self.dev = open_device(trace_region_size=trace_mib << 20)
+        self.tail, self.tail_pieces = None, 0
         try:
-            self.model = Inkling2Model(self.dev, root=cache, max_ctx=max_ctx, log=lambda s: None)
+            self.model = m = Inkling2Model(self.dev, root=cache, max_ctx=max_ctx, log=lambda s: None)
             log(f"model loaded in {time.time() - t0:.0f} s")
-            self.gen = Generator(self.model)
+            self.chain = self._alias_token(m)
+            m.set_inputs(0, 0)
+            lg = m.step()["logits"]  # compiles the step; the head's logits are a module buffer, the same in the traces
+            tail = lg.layout == ttnn.TILE_LAYOUT and m.head_tail is not None
+            if tail:
+                for k in self.TAIL_PIECES:  # compile every tail variant before any trace exists
+                    for t in self._rows(lg, k):
+                        ttnn.deallocate(t)
+            self.gen = Generator(m)
             self.gen.capture()
-            log(f"decode traces captured, {time.time() - t0:.0f} s")
+            if tail and all(o["logits"].buffer_address() == lg.buffer_address() for o in self.gen.out):
+                self.tail = self._capture_tail(lg)
+            log(
+                f"decode traces captured, {time.time() - t0:.0f} s (token chain {'on' if self.chain else 'off'}, "
+                f"logits row tail {f'{self.tail_pieces} pieces' if self.tail else 'off'})"
+            )
         except BaseException:
             self.ttnn.close_device(self.dev)
             raise
         self.out = None
+        host = lambda: ttnn.from_torch(torch.zeros(1, 1, 1, 1, dtype=torch.int32), dtype=ttnn.uint32)  # noqa: E731
+        self.slots = [[host(), None, -1] for _ in range(2)]  # [host token, event, pos]
+
+    def _alias_token(self, m):
+        """model.tokens = a [1, 1] view of the head's argmax buffer [1, 1, 1, 1] (both uint32 ROW_MAJOR DRAM)."""
+        ht = m.head_tail
+        if ht is None:
+            return False
+        view = self.ttnn.reshape(ht.token, [1, 1])
+        if view.buffer_address() != ht.token.buffer_address():
+            return False
+        m.tokens = view
+        return True
+
+    # The tail's circular buffers must fit under the decode's L1 staging (with a PF cache also the expert ring):
+    # the logits go to rows in this many pieces, the first count that fits.
+    TAIL_PIECES = (1, 2, 4, 8, 16)
+
+    def _rows(self, lg, k):
+        """[1, 1, 1, W] TILE -> k ROW_MAJOR pieces of whole tiles, in order."""
+        ttnn, tiles = self.ttnn, lg.shape[-1] // 32
+        out, a = [], 0
+        for j in range(k):
+            b = tiles * (j + 1) // k * 32
+            piece = lg if k == 1 else ttnn.slice(lg, [0, 0, 0, a], [1, 1, 1, b])
+            out.append(ttnn.to_layout(piece, ttnn.ROW_MAJOR_LAYOUT))
+            a = b
+        return out
+
+    def _capture_tail(self, lg):
+        """Trace: TILE logits -> fp32 rows. Checked once against the full TILE read; None if no piece count fits or
+        the rows are not bit-equal."""
+        ttnn = self.ttnn
+        for k in self.TAIL_PIECES:
+            tid = ttnn.begin_trace_capture(self.dev, cq_id=0)
+            try:
+                self.rows = self._rows(lg, k)
+            except RuntimeError:  # circular buffers clash with L1 buffers
+                ttnn.end_trace_capture(self.dev, tid, cq_id=0)
+                ttnn.release_trace(self.dev, tid)
+                continue
+            ttnn.end_trace_capture(self.dev, tid, cq_id=0)
+            self.gen.decode(0, 0)
+            ttnn.execute_trace(self.dev, tid, cq_id=0, blocking=False)
+            want = ttnn.to_torch(lg).float().reshape(-1)
+            got = torch.cat([ttnn.to_torch(t).float().reshape(-1) for t in self.rows])
+            if torch.equal(want.view(torch.int32), got.view(torch.int32)):
+                self.tail_pieces = k
+                return tid
+            ttnn.release_trace(self.dev, tid)
+        return None
 
     def reset(self):
         self.model.reset()
 
-    def feed(self, token, pos):
-        self.out = self.gen.decode(token, pos, traced=True)
+    def _run(self, pos, read):
+        from models.demos.inkling2_mini.tt.fused.conv import FusedShortConv
 
-    def read_token(self):
-        return self.gen.read_token(self.out)
+        ttnn, ph = self.ttnn, pos % FusedShortConv.PHASES
+        ttnn.execute_trace(self.dev, self.gen.trace[ph], cq_id=0, blocking=False)
+        self.out = self.gen.out[ph]
+        if read:
+            s = self.slots[pos % 2]
+            if s[1] is not None:
+                ttnn.event_synchronize(s[1])  # the slot's last read has landed before it is read into again
+            ttnn.copy_device_to_host_tensor(self.out["token"], s[0], blocking=False, cq_id=0)
+            s[1], s[2] = ttnn.record_event(self.dev, cq_id=0), pos
+
+    def feed(self, token, pos, read=True):
+        self.model.set_inputs(token, pos)
+        self._run(pos, read)
+
+    def feed_next(self, pos):
+        if not self.chain:
+            return self.feed(self.token_at(pos - 1), pos)
+        self.model.phase = pos % len(self.gen.trace)
+        self.model.positions.update(pos)
+        self._run(pos, True)
+
+    def token_at(self, pos):
+        s = self.slots[pos % 2]
+        assert s[2] == pos, f"no token read queued for pos {pos}"
+        self.ttnn.event_synchronize(s[1])
+        return int(self.ttnn.to_torch(s[0]).reshape(-1)[0])
 
     def read_logits(self):
-        return self.ttnn.to_torch(self.out["logits"]).float().reshape(-1)[: self.vocab]
+        if self.tail is None:
+            return self.ttnn.to_torch(self.out["logits"]).float().reshape(-1)[: self.vocab]
+        self.ttnn.execute_trace(self.dev, self.tail, cq_id=0, blocking=False)
+        return torch.cat([self.ttnn.to_torch(t).float().reshape(-1) for t in self.rows])[: self.vocab]
 
     def close(self):
+        if self.tail is not None:
+            self.ttnn.release_trace(self.dev, self.tail)
         self.gen.release()
         self.ttnn.close_device(self.dev)
 
@@ -157,7 +260,7 @@ class Engine:
         for i, t in enumerate(ids):
             if job.cancel.is_set():
                 return False
-            r.feed(t, len(self.fed))
+            r.feed(t, len(self.fed), read=i == len(ids) - 1)  # only the last step's argmax is read
             self.fed.append(t)
             self.last_logits = None
             now = time.perf_counter()
@@ -170,11 +273,6 @@ class Engine:
                     )
                 )
         return True
-
-    def _next(self, job):
-        if job.sampler.greedy:
-            return self.runner.read_token()
-        return job.sampler(self.runner.read_logits())
 
     def _run(self, job):
         r, prompt = self.runner, job.prompt
@@ -199,20 +297,44 @@ class Engine:
         new = []
         finish = "length"
         t1 = None
+        greedy = job.sampler.greedy
+        ahead = False  # a step on the argmax of the step at len(fed) - 1 is queued at len(fed) (greedy)
+
+        def look_ahead():  # greedy: queue the next step on the card's own argmax before the host has read it
+            nonlocal ahead
+            if greedy and not forced and len(new) + 1 < limit and len(self.fed) < r.max_ctx:
+                r.feed_next(len(self.fed))
+                ahead = True
+
+        if n_prompt:
+            look_ahead()
         while len(new) < limit:
             if forced:
                 t = forced.pop(0)
             elif self.last_logits is not None:  # prompt == fed: sample from the kept logits
                 lg = self.last_logits
-                t = int(lg.argmax()) if job.sampler.greedy else job.sampler(lg)
+                t = int(lg.argmax()) if greedy else job.sampler(lg)
+            elif greedy:
+                t = r.token_at(len(self.fed) - 1)
             else:
-                t = self._next(job)
+                t = job.sampler(r.read_logits())
             if t1 is None:
                 t1 = time.perf_counter()  # prompt done: first token known
             if t in self.sp.stop and not job.raw:
                 finish = "stop"
+                if ahead:  # the step on t already ran: t is fed
+                    self.fed.append(t)
+                    self.last_logits = None
                 break
             new.append(t)
+            # the step on t goes to the card before the text work below; once queued, t counts as fed
+            queued, ahead = ahead, False
+            if not queued and len(new) < limit:
+                r.feed(t, len(self.fed), read=greedy)
+                queued = True
+            if queued:
+                self.fed.append(t)
+                self.last_logits = None
             for piece in parser.push(t):
                 job.events.put(("piece", piece))
             if parser.stopped:
@@ -228,9 +350,7 @@ class Engine:
                     job.thinking_budget = -1
             if len(new) == limit:
                 break
-            r.feed(t, len(self.fed))
-            self.fed.append(t)
-            self.last_logits = None
+            look_ahead()
         if t1 is None:
             t1 = time.perf_counter()
         for piece in parser.finish():

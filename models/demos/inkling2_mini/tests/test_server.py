@@ -173,3 +173,30 @@ def test_sampler():
         s = Sampler(t, top_p=top_p, min_p=min_p, seed=0)
         got = torch.bincount(torch.tensor([s(lg) for _ in range(20000)]), minlength=6).float() / 20000
         assert (got - want / want.sum()).abs().max() < 0.02
+
+
+def test_greedy_feeds_stop_token(srv):
+    base, runner, _ = srv
+    body = {"messages": USER, "temperature": 0}
+    r = json.loads(post(base + "/v1/chat/completions", body)[1])
+    t, msg = r["timings"], r["choices"][0]["message"]
+    assert msg["content"] == "Hello! I am a stub, not the model." and r["choices"][0]["finish_reason"] == "stop"
+    resets = runner.resets
+    msgs = USER + [{"role": "assistant", "content": msg["content"], "reasoning_content": msg["reasoning_content"]}]
+    r = json.loads(post(base + "/v1/chat/completions", {"messages": msgs + USER, "temperature": 0})[1])
+    # the step queued ahead ran on the stop token: it counts as fed, and the next prompt has it after the reply
+    assert runner.resets == resets and r["timings"]["cache_n"] == t["prompt_n"] + t["predicted_n"] + 1
+    assert r["choices"][0]["message"]["content"] == "Hello! I am a stub, not the model."
+
+
+def test_pf_cache(tmp_path):
+    from models.demos.inkling2_mini.server.server import pf_cache
+
+    def cache(name, layout):
+        (tmp_path / name).mkdir()
+        lay = {"L00/e": layout, "L00/e.x": layout + "_X"}
+        (tmp_path / name / "manifest.json").write_text(json.dumps({"expert_layout": lay}))
+        return str(tmp_path / name)
+
+    bank, pf, stick = cache("v1-bank", "BANK"), cache("v1-pf", "PF"), cache("v2-stick", "STICK")
+    assert pf_cache(bank, log=lambda s: None) == pf and pf_cache(pf) == pf and pf_cache(stick) == stick

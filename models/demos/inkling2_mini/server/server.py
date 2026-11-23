@@ -346,6 +346,28 @@ def serve(app, host, port):
     return httpd
 
 
+def pf_cache(cache, log=print):
+    """The PF-layout twin of a weight cache when there is one: `<base>-pf` next to `<base>[-<layout>]` (e.g. v1-bank
+    -> v1-pf), with every expert tensor in the PF layout. With it the decode streams guessed experts ahead
+    (tt/mk/expert_overlap.py, ~0.3 ms/token at 4K). Else the cache as given."""
+    c = Path(cache)
+
+    def is_pf(d):
+        try:
+            lay = json.loads((d / "manifest.json").read_text()).get("expert_layout") or {}
+        except (OSError, ValueError):
+            return False
+        return bool(lay) and all(v.startswith("PF") for v in lay.values())  # PF main + PF_X extra tensors
+
+    if is_pf(c):
+        return str(c)
+    twin = c.with_name(c.name.split("-")[0] + "-pf")
+    if twin != c and is_pf(twin):
+        log(f"cache {c} has no PF expert layout; using {twin} (--exact-cache keeps {c.name})")
+        return str(twin)
+    return str(c)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1: this machine only)")
@@ -356,6 +378,7 @@ def main(argv=None):
     ap.add_argument("--max-tokens", type=int, default=-1, help="default reply limit (-1: up to the context)")
     ap.add_argument("--ui-dir", default=None, help="Llama Chat static files (fetch_ui.py prints the path)")
     ap.add_argument("--fake", action="store_true", help="no card: a stub model that echoes (HTTP layer tests)")
+    ap.add_argument("--exact-cache", action="store_true", help="load --cache as given, not its PF-layout twin")
     a = ap.parse_args(argv)
     if a.ckpt is None:
         ap.error("--ckpt or INKLING_CKPT is required (the tokenizer and chat template)")
@@ -379,7 +402,8 @@ def main(argv=None):
     else:
         from models.demos.inkling2_mini.server.engine import TTRunner
 
-        make = lambda: TTRunner(a.cache, a.max_ctx, log=log)  # noqa: E731
+        cache = a.cache if a.exact_cache else pf_cache(a.cache, log)
+        make = lambda: TTRunner(cache, a.max_ctx, log=log)  # noqa: E731
     engine = Engine(make, tok, special, log=log)
     tmpl = Path(a.ckpt, "chat_template.jinja")
     app = App(
