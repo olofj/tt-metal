@@ -1126,6 +1126,122 @@ def test_sparse_matmul_compact_shape_coincides_with_expanded(device):
     torch.testing.assert_close(output_torch, reference, rtol=0.1, atol=1.5)
 
 
+@pytest.mark.parametrize("is_input_a_sparse", [True, False])
+@pytest.mark.parametrize("per_core_N", [1, 2])
+def test_sparse_matmul_expanded_output_zeroes_skipped_blocks(device, is_input_a_sparse, per_core_N):
+    """An expanded output's skipped blocks are written as exact zeros by the matmul program itself:
+    a caller-supplied output full of a sentinel must come back with zeros wherever the mask is 0."""
+    torch.manual_seed(0)
+    num_experts, m, k, n = 8, 32, 128, 192
+    sentinel = 96.0
+    a_batch = num_experts if is_input_a_sparse else 2
+    in0_torch = torch.randn((1, a_batch, m, k), dtype=torch.bfloat16)
+    in1_torch = torch.randn((1, num_experts, k, n), dtype=torch.bfloat16)
+    mask = torch.zeros(num_experts, dtype=torch.bfloat16)
+    mask[[1, 2, 5]] = 1.0
+    sparsity_shape = (1, 1, 1, num_experts) if is_input_a_sparse else (1, a_batch, 1, num_experts)
+    sparsity_torch = mask.expand(sparsity_shape).contiguous()
+    out_shape = (1, num_experts, m, n) if is_input_a_sparse else (1, a_batch, 1, num_experts, m, n)
+
+    put = lambda t, layout=ttnn.TILE_LAYOUT: ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=layout, device=device)
+    output_tensor = put(torch.full(out_shape, sentinel, dtype=torch.bfloat16))
+    program_config = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(6 // per_core_N, 1),
+        in0_block_w=1,
+        out_subblock_h=1,
+        out_subblock_w=per_core_N,
+        out_block_h=1,
+        out_block_w=per_core_N,
+        per_core_M=1,
+        per_core_N=per_core_N,
+        fuse_batch=False,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+    output = ttnn.sparse_matmul(
+        put(in0_torch),
+        put(in1_torch),
+        sparsity=put(sparsity_torch, ttnn.ROW_MAJOR_LAYOUT),
+        nnz=int(sparsity_torch.sum()),
+        is_input_a_sparse=is_input_a_sparse,
+        is_input_b_sparse=True,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        program_config=program_config,
+        dtype=ttnn.bfloat16,
+        optional_output_tensor=output_tensor,
+    )
+
+    out = ttnn.to_torch(output).float().reshape(-1, num_experts, m, n)
+    for b in range(out.shape[0]):
+        for e in range(num_experts):
+            if mask[e] == 0:
+                assert (out[b, e] == 0).all(), f"skipped block ({b}, {e}) not zeroed"
+            else:
+                ref = in0_torch[0, e if is_input_a_sparse else b].float() @ in1_torch[0, e].float()
+                assert not (out[b, e] == sentinel).any()
+                torch.testing.assert_close(out[b, e], ref, rtol=0.1, atol=1.5)
+
+
+@pytest.mark.parametrize("matmul_sub_device_index", [0, 1])
+def test_sparse_matmul_on_non_first_sub_device(device, matmul_sub_device_index):
+    """tt-metal#66852: an expanded sparse output used to be zeroed by a separate fill op on the first
+    sub-device's cores, unordered with a matmul on another sub-device, so program-cache hits there
+    returned wrong tiles. The output must be bit-equal to a run without a sub-device manager."""
+    torch.manual_seed(0)
+    gm, k, n, num_experts = 64, 256, 2304, 64  # small K: the matmul writes its output early
+    put = lambda t, dt, layout=ttnn.TILE_LAYOUT: ttnn.from_torch(t, dtype=dt, layout=layout, device=device)
+    in1 = put(torch.randn(1, num_experts, k, n) * 0.02, ttnn.bfloat4_b)
+    mask = torch.zeros(1, 1, 1, num_experts)
+    mask.view(-1)[torch.randperm(num_experts)[: num_experts // 2]] = 1.0
+    sparsity = put(mask, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+    program_config = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(9, 4),
+        in0_block_w=k // 32,
+        out_subblock_h=2,
+        out_subblock_w=2,
+        out_block_h=2,
+        out_block_w=2,
+        per_core_M=2,
+        per_core_N=2,
+        fuse_batch=False,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+    in0s = [put(torch.randn(1, num_experts, gm, k), ttnn.bfloat16) for _ in range(4)]
+
+    def run(in0):
+        out = ttnn.sparse_matmul(
+            in0,
+            in1,
+            sparsity=sparsity,
+            nnz=num_experts // 2,
+            is_input_a_sparse=True,
+            is_input_b_sparse=True,
+            program_config=program_config,
+            dtype=ttnn.bfloat16,
+        )
+        return ttnn.to_torch(out)
+
+    device.clear_program_cache()
+    refs = [run(in0) for in0 in in0s]
+
+    # The matmul's cores (rows 0-3) sit in the rows 0-4 sub-device; only its index in the manager changes.
+    grid = device.compute_with_storage_grid_size()
+    rows = lambda y0, y1: ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, y0), ttnn.CoreCoord(grid.x - 1, y1 - 1))})
+    sub_devices = [rows(0, 5), rows(5, grid.y)]
+    if matmul_sub_device_index == 1:
+        sub_devices.reverse()
+    manager = device.create_sub_device_manager([ttnn.SubDevice([cores]) for cores in sub_devices], 0)
+    device.load_sub_device_manager(manager)
+    try:
+        device.clear_program_cache()
+        equal = [bool(torch.equal(run(in0), ref)) for in0, ref in zip(in0s, refs)]  # a miss, then hits
+    finally:
+        device.clear_loaded_sub_device_manager()
+        device.remove_sub_device_manager(manager)
+    assert all(equal), f"bit-equal per call [miss, hits...]: {equal}"
+
+
 def test_sparse_matmul_rejects_indivisible_subblock(device, expect_error):
     """out_subblock_w must divide out_block_w, otherwise in1_num_subblocks is 0 and mcast_in0 deadlocks."""
     in0, in1, sparsity, nnz, pc, dims = _make_sparse_inputs(device)

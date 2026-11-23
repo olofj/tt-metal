@@ -18,6 +18,8 @@
 //   IN1_DRAM_WIDTH_SHARDED    -- in1 is read bank-by-bank from DRAM using tensor::in1's base address
 //   IN1_DRAM_HEIGHT_SHARDED   -- ditto, one complete [K, N] matrix per bank
 //   SPARSITY                  -- the sparsity operand (scratch::sparsity + tensor::sparsity) is bound
+//   ZERO_SKIPPED_OUT          -- (with SPARSITY, expanded output) scratch::out_zeros is bound and
+//                                this kernel writes zero tiles for its slice of every skipped batch
 //   OUT_SHARDED               -- output stays resident in dfb::out; the writer loop is compiled out
 //
 // The DRAM-width-sharded path takes its per-bank list as runtime varargs, walked two at a time:
@@ -322,6 +324,52 @@ void kernel_main() {
     };
 #endif  // SPARSITY
 
+#ifdef ZERO_SKIPPED_OUT
+    // Expanded sparse output: the blocks of skipped batches must read as zero. This kernel writes
+    // them itself, so the one program writes every output tile. A separate fill op before the
+    // matmul is not ordered with it when the two land on different sub-devices (tt-metal#66852).
+    // out_zeros is one output tile of zeros; the walk below mirrors the writer loop's tile ids.
+    Scratchpad<uint8_t> out_zeros(scratch::out_zeros);
+    noc.async_write_zeros(out_zeros, output_single_tile_size_bytes);
+    noc.write_zeros_l1_barrier();
+    const auto zero_out_batch = [&](uint32_t out_batch_tile_id) {
+        uint32_t out_h_block_tile_id = out_batch_tile_id;
+        for (uint32_t bh = 0; bh < num_blocks_h_dim; ++bh) {
+            uint32_t out_w_block_tile_id = out_h_block_tile_id;
+            for (uint32_t bw = 0; bw < num_blocks_w_dim; ++bw) {
+                const uint32_t num_blocks_w_dim_ =
+                    bw >= last_num_blocks_w_dim - 1 ? last_num_blocks_w_dim : num_blocks_w_dim;
+                const uint32_t num_sb_w =
+                    bw == num_blocks_w_dim_ - 1 ? out_last_num_nonzero_subblocks_w : out_num_nonzero_subblocks_w;
+                uint32_t sbh_tile_id = out_w_block_tile_id;
+                for (uint32_t sbh = 0; bw < num_blocks_w_dim_ && sbh < out_num_nonzero_subblocks_h; ++sbh) {
+                    const uint32_t sb_h = (bh == num_blocks_h_dim - 1 && sbh == out_num_nonzero_subblocks_h - 1)
+                                              ? out_last_subblock_h
+                                              : out_subblock_h;
+                    uint32_t sbw_tile_id = sbh_tile_id;
+                    for (uint32_t sbw = 0; sbw < num_sb_w; ++sbw) {
+                        const uint32_t sb_w =
+                            (bw == num_blocks_w_dim_ - 1 && sbw == num_sb_w - 1) ? out_last_subblock_w : out_subblock_w;
+                        uint32_t row_tile_id = sbw_tile_id;
+                        for (uint32_t h = 0; h < sb_h; ++h) {
+                            uint32_t tile_id = row_tile_id;
+                            for (uint32_t w = 0; w < sb_w; ++w) {
+                                noc.async_write(out_zeros, s, output_single_tile_size_bytes, {}, {.page_id = tile_id});
+                                tile_id += out_tensor_stride_w;
+                            }
+                            row_tile_id += out_tensor_stride_h;
+                        }
+                        sbw_tile_id += out_tensor_next_subblock_stride_w;
+                    }
+                    sbh_tile_id += out_tensor_next_subblock_stride_h;
+                }
+                out_w_block_tile_id += out_tensor_next_w_dim_block_stride;
+            }
+            out_h_block_tile_id += out_tensor_next_h_dim_block_stride;
+        }
+    };
+#endif  // ZERO_SKIPPED_OUT
+
 #ifdef IN1_SHARDED
     uint64_t in1_start_address = dfb_in1.get_write_ptr();
 #endif  // IN1_SHARDED
@@ -406,6 +454,9 @@ void kernel_main() {
             } else if constexpr (batchB > 0) {
                 if (read_sparsity(bB) == 0) {
                     if constexpr (!compact_output) {
+#ifdef ZERO_SKIPPED_OUT
+                        zero_out_batch(out_tensor_start_tile_id);
+#endif
                         out_tensor_start_tile_id += MtNt;
                     }
                     in1_batch_tile_id += KtNt;

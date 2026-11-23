@@ -4,7 +4,6 @@
 
 #include "ttnn/operations/matmul/device/sparse/sparse_matmul_device_operation.hpp"
 #include "ttnn/core.hpp"
-#include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/tensor/tensor_ops.hpp"
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include "ttnn/operations/matmul/device/matmul_device_operation_types.hpp"
@@ -639,16 +638,9 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
     SparseMatmulDeviceOperation::tensor_return_value_t output_tensors;
     const auto& optional_output_tensors = tensor_args.optional_output_tensors;
     const auto& input_tensors = tensor_args.input_tensors;
-    // A compact output is fully written by the in1 writer (one block per non-zero sparsity entry),
-    // so it skips the zero-fill below; expanded outputs rely on it to zero the skipped blocks.
-    // The indexed mode's output is compact too (one block per id, every block written).
-    const bool compact_output = operation_attributes.use_indices ||
-                                (!optional_output_tensors.empty() && optional_output_tensors[0].has_value() &&
-                                 operation_attributes.nnz.has_value() &&
-                                 optional_output_tensors[0]->logical_shape() ==
-                                     compute_sparse_matmul_compact_output_shape(
-                                         input_tensors.at(0), input_tensors.at(1), operation_attributes.nnz.value()));
-
+    // No zero-fill here: the program writes every output tile, zeroing the blocks of skipped
+    // batches in its in1 writer. A separate fill op is not ordered with the matmul when the two run
+    // on different sub-devices (tt-metal#66852).
     if (!optional_output_tensors.empty() and optional_output_tensors[0].has_value()) {
         output_tensors.reserve(optional_output_tensors.size());
         for (const auto& optional_output_tensor : optional_output_tensors) {
@@ -657,17 +649,6 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
                 "If using optional output tensors, all output tensors must have a value");
             output_tensors.emplace_back(optional_output_tensor.value());
         }
-        if (!compact_output) {
-            for (auto& output_tensor : output_tensors) {
-                output_tensor = ttnn::zeros_like(
-                    output_tensor,
-                    std::nullopt,
-                    std::nullopt,
-                    std::nullopt,
-                    std::nullopt,
-                    std::optional<Tensor>(output_tensor));
-            }
-        }
         return output_tensors;
     }
     const auto& device = input_tensors.at(0).device();
@@ -675,18 +656,6 @@ SparseMatmulDeviceOperation::tensor_return_value_t SparseMatmulDeviceOperation::
     output_tensors.reserve(output_specs.size());
     for (const auto& output_spec : output_specs) {
         output_tensors.emplace_back(create_device_tensor(output_spec, device));
-    }
-    if (compact_output) {  // indexed mode
-        return output_tensors;
-    }
-    for (auto& output_tensor : output_tensors) {
-        output_tensor = ttnn::zeros_like(
-            output_tensor,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::optional<Tensor>(output_tensor));
     }
     return output_tensors;
 }

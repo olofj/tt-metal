@@ -3523,6 +3523,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
 
     const ScratchpadSpecName SPARSITY_IN0_SCRATCH{"sparsity_in0"};
     const ScratchpadSpecName SPARSITY_IN1_SCRATCH{"sparsity_in1"};
+    const ScratchpadSpecName OUT_ZEROS_SCRATCH{"out_zeros"};
 
     const TensorParamName IN0{"in0"};
     const TensorParamName IN1{"in1"};
@@ -3562,6 +3563,9 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
     if (use_sparsity) {
         mm_kernel_in0_sender_writer_defines["SPARSITY"] = "1";
         mm_kernel_in1_sender_writer_defines["SPARSITY"] = "1";
+        if (!sparsity->compact_output) {
+            mm_kernel_in1_sender_writer_defines["ZERO_SKIPPED_OUT"] = "1";
+        }
     }
     if (bias_tensor.has_value()) {
         mm_kernel_defines["FUSE_BIAS"] = "1";
@@ -3840,6 +3844,15 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
                 .size_per_node = mask_aligned_page_size,
             });
         }
+    }
+    // Expanded sparse output: the in1 writer zeroes the blocks of skipped batches from one zero tile
+    // it keeps here, so the whole output comes from this one program.
+    const bool zero_skipped_out = use_sparsity && !sparsity->compact_output;
+    if (zero_skipped_out) {
+        scratchpads.push_back(ScratchpadSpec{
+            .unique_id = OUT_ZEROS_SCRATCH,
+            .size_per_node = output_single_tile_size,
+        });
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -4130,6 +4143,10 @@ static ttnn::device_operation::ProgramArtifacts create_program_mcast_in0_artifac
             in1_sender.compile_time_args.insert({"sparsity_pagesize", mask_aligned_page_size});
         }
         add_sparsity_bindings(in1_sender, SPARSITY_IN1_SCRATCH);
+        if (zero_skipped_out) {
+            in1_sender.scratchpad_bindings.push_back(
+                ScratchpadBinding{.scratchpad_spec_name = OUT_ZEROS_SCRATCH, .accessor_name = "out_zeros"});
+        }
 
         Group<std::string> in1_sender_rta_names = {
             "in1_tensor_start_tile_id",

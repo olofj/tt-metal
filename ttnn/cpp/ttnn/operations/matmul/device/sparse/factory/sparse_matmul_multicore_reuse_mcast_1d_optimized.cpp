@@ -403,6 +403,7 @@ ttnn::device_operation::ProgramArtifacts SparseMatmulMultiCoreReuseMcast1DProgra
 
     const ScratchpadSpecName SPARSITY_SCRATCH{"sparsity"};
     const ScratchpadSpecName IN1_SPARSITY_SCRATCH{"in1_sparsity"};
+    const ScratchpadSpecName OUT_ZEROS_SCRATCH{"out_zeros"};
 
     const TensorParamName IN0{"in0"};
     const TensorParamName IN1{"in1"};
@@ -536,6 +537,15 @@ ttnn::device_operation::ProgramArtifacts SparseMatmulMultiCoreReuseMcast1DProgra
             .size_per_node = in1_sparsity_pagesize,
         },
     };
+    // Expanded output (mask mode, not compact): the in1 writer zeroes the blocks of skipped batches
+    // from one zero tile it keeps here, so the whole output comes from this one program.
+    const bool zero_skipped_out = !use_indices && !compact_output;
+    if (zero_skipped_out) {
+        scratchpads.push_back(ScratchpadSpec{
+            .unique_id = OUT_ZEROS_SCRATCH,
+            .size_per_node = output_single_tile_size,
+        });
+    }
 
     ////////////////////////////////////////////////////////////////////////////
     //                      Defines
@@ -579,6 +589,9 @@ ttnn::device_operation::ProgramArtifacts SparseMatmulMultiCoreReuseMcast1DProgra
     // but the define is still required, because the shared kernels default to sparsity-off.
     mm_kernel_in0_sender_writer_defines["SPARSITY"] = "1";
     mm_kernel_in1_sender_writer_defines["SPARSITY"] = "1";
+    if (zero_skipped_out) {
+        mm_kernel_in1_sender_writer_defines["ZERO_SKIPPED_OUT"] = "1";
+    }
 
     // A buffer that is not bound has no dfb:: token, so a define hides the references to dfb::batch_valid
     // in the kernels. The in0 receiver gets the define next to its binding below.
@@ -856,6 +869,10 @@ ttnn::device_operation::ProgramArtifacts SparseMatmulMultiCoreReuseMcast1DProgra
         // Stride 1 along N within the group's bias tile row.
         in1_sender.compile_time_args.insert({"in3_tensor_stride_w", 1u});
         in1_sender.runtime_arg_schema.runtime_arg_names.push_back("in3_tensor_start_tile_id");
+    }
+    if (zero_skipped_out) {
+        in1_sender.scratchpad_bindings.push_back(
+            ScratchpadBinding{.scratchpad_spec_name = OUT_ZEROS_SCRATCH, .accessor_name = "out_zeros"});
     }
     kernels.push_back(std::move(in1_sender));
 
