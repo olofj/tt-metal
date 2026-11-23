@@ -76,6 +76,7 @@ void kernel_main() {
         noc_async_read(ids.get_noc_addr(0) + r * 32, scr + r * 16, 16);
         noc_async_read(wts.get_noc_addr(0) + r * 32, scr + 64 + r * 16, 16);
     }
+#ifndef X_MCAST  // else the collector multicasts all rows of x and the writer pushes cb_x
     if (flags & F_GU) {
         cb_reserve_back(cb_x, rows * x_tiles);
         const uint32_t xl = get_write_ptr(cb_x);
@@ -87,10 +88,13 @@ void kernel_main() {
             }
         }
     }
+#endif
     noc_async_read_barrier();
+#ifndef X_MCAST
     if (flags & F_GU) {
         cb_push_back(cb_x, rows * x_tiles);
     }
+#endif
     volatile tt_l1_ptr uint16_t* id16 = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scr);
 
     // plan
