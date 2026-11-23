@@ -81,6 +81,24 @@ generates the golden prompts (`--golden`) and compares prompt 0 with the golden 
 checks that a traced decode step replays bit-equal and matches eager, and measures decode speed at
 `--perf-pos` positions.
 
+## Chat in a browser
+
+`server/` is a small single-user chat server: the OpenAI chat API (`/v1/chat/completions`, streamed or not,
+`/v1/models`) plus the llama-server endpoints that llama.cpp's web UI (Llama Chat) reads. Each reply carries
+llama-server's `timings` (prompt and generation tokens, ms, tok/s), which the UI shows under the reply; the
+model's reasoning comes as `reasoning_content`.
+
+```
+python -m models.demos.inkling2_mini.server.fetch_ui       # once: Llama Chat (MIT), pinned and sha256-checked
+python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT --cache $INKLING_CACHE --max-ctx 16384
+```
+
+Then open http://127.0.0.1:8080/ once the log says the traces are captured (the UI waits while the model
+loads). It binds 127.0.0.1 (`--host` to change) and holds the card until Ctrl-C. Open WebUI or any OpenAI
+client works too: base URL `http://127.0.0.1:8080/v1`, any API key. The prompt is fed by the traced
+decode step token by token (~decode speed); a next turn that extends the previous conversation feeds only its
+new tokens. `--fake` runs the HTTP layer with a stub model and no card (`tests/test_server.py`).
+
 ## Run the tests
 
 ```
