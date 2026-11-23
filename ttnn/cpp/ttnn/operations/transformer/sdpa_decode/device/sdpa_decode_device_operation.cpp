@@ -17,6 +17,10 @@
 
 using namespace tt::tt_metal;
 
+namespace ttnn::operations::generic {
+ttsl::hash::hash_t compute_program_descriptor_hash(const tt::tt_metal::ProgramDescriptor& program_descriptor);
+}
+
 namespace ttnn::prim {
 void SdpaDecodeDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
@@ -638,6 +642,27 @@ tt::tt_metal::TensorSpec SdpaDecodeDeviceOperation::compute_output_specs(
         output_shape, TensorLayout(input.dtype(), PageConfig(output_layout), operation_attributes.output_mem_config));
 }
 
+std::vector<tt::tt_metal::DynamicRuntimeArg> SdpaDecodeDeviceOperation::get_dynamic_runtime_args(
+    const operation_attributes_t& operation_attributes,
+    const tensor_args_t& /*tensor_args*/,
+    tensor_return_value_t& /*tensor_return_value*/,
+    const std::optional<ttnn::MeshCoordinate>& /*mesh_coordinate*/) {
+    std::vector<tt::tt_metal::DynamicRuntimeArg> args;
+    const auto& extra = operation_attributes.extra_kernels.desc;
+    if (!extra) {
+        return args;
+    }
+    // create_descriptor appends them after the op's own kSdpaDecodeKernels kernels
+    for (uint32_t j = 0; j < extra->kernels.size(); ++j) {
+        for (const auto& [core, values] : extra->kernels[j].runtime_args) {
+            for (uint32_t i = 0; i < values.size(); ++i) {
+                args.push_back({.kernel_idx = kSdpaDecodeKernels + j, .core = core, .arg_idx = i, .value = values[i]});
+            }
+        }
+    }
+    return args;
+}
+
 Tensor SdpaDecodeDeviceOperation::create_output_tensors(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.q.device());
@@ -665,8 +690,17 @@ Tensor sdpa_decode(
     std::optional<uint32_t> head_dim_v,
     std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
     std::optional<uint32_t> cache_position_modulo,
-    uint32_t spec_multi_pos_tiles) {
+    uint32_t spec_multi_pos_tiles,
+    const std::optional<tt::tt_metal::ProgramDescriptor>& extra_kernels) {
     using OperationType = SdpaDecodeDeviceOperation;
+    SdpaExtraKernels extra{};
+    if (extra_kernels.has_value() && !extra_kernels->kernels.empty()) {
+        TT_FATAL(
+            extra_kernels->cbs.empty() && extra_kernels->semaphores.empty(),
+            "sdpa_decode extra_kernels: kernels only (no CBs or semaphores)");
+        extra.desc = std::make_shared<const tt::tt_metal::ProgramDescriptor>(*extra_kernels);
+        extra.hash = ttnn::operations::generic::compute_program_descriptor_hash(*extra_kernels);
+    }
     auto operation_attributes = OperationType::operation_attributes_t{
         .is_causal = is_causal,
         .paged_attention = paged_attention,
@@ -684,6 +718,7 @@ Tensor sdpa_decode(
             paged_cache_geometry.value_or(ttnn::operations::transformer::PagedCacheGeometryOverride{}),
         .cache_position_modulo = cache_position_modulo,
         .spec_multi_pos_tiles = spec_multi_pos_tiles,
+        .extra_kernels = std::move(extra),
     };
 
     auto tensor_args = OperationType::tensor_args_t{

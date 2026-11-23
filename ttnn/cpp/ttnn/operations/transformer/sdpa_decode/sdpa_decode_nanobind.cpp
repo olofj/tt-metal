@@ -54,6 +54,7 @@ void bind_sdpa_decode(nb::module_& mod) {
             compute_kernel_config (ttnn.DeviceComputeKernelConfig, optional): Defaults to `None`.
             sliding_window_size (int, optional): The size of sliding window for sliding window attention. Defaults to `None`.
             share_cache (bool, optional): KV cache sharing across batch for decode. `True` enables, `False` disables. Defaults to `None` (distinct program-cache key from explicit `False`).
+            extra_kernels (ttnn.ProgramDescriptor, optional): caller kernels appended to the program, on cores the op does not use (no CBs or semaphores); only their descriptor hash keys the program cache and their runtime args are re-applied on every call. Defaults to `None`.
 
 
         Returns:
@@ -82,7 +83,8 @@ void bind_sdpa_decode(nb::module_& mod) {
         nb::arg("memory_config") = nb::none(),
         nb::arg("program_config") = nb::none(),
         nb::arg("compute_kernel_config") = nb::none(),
-        nb::arg("share_cache") = nb::none());
+        nb::arg("share_cache") = nb::none(),
+        nb::arg("extra_kernels") = nb::none());
 
     ttnn::bind_function<"paged_scaled_dot_product_attention_decode", "ttnn.transformer.">(
         mod,
