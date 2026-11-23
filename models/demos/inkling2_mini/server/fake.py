@@ -21,19 +21,29 @@ class EchoRunner:
         self.script = tok.encode(reply, add_special_tokens=False)
         self.vocab = len(tok)
         self.seq = []
+        self.out = {}  # pos -> the step's argmax
         self.resets = 0
 
     def reset(self):
         self.seq = []
+        self.out = {}
         self.resets += 1
 
-    def feed(self, token, pos):
+    def feed(self, token, pos, read=True):
         assert pos == len(self.seq), (pos, len(self.seq))
         self.seq.append(token)
+        self.out[pos] = self._next()
         if self.step_s:
             time.sleep(self.step_s)
 
-    def read_token(self):
+    def feed_next(self, pos):
+        self.feed(self.out[pos - 1], pos)
+
+    def token_at(self, pos):
+        assert pos == len(self.seq) - 1 or pos == len(self.seq) - 2, (pos, len(self.seq))
+        return self.out[pos]
+
+    def _next(self):
         # the reply so far (longest tail of seq that is a head of the script) -> its next token; else a tail of >= 2
         # tokens found inside the script (a forced end of reasoning) -> the token after it; else the first token
         s = self.script
@@ -49,5 +59,5 @@ class EchoRunner:
 
     def read_logits(self):
         lg = torch.full((self.vocab,), -10.0)
-        lg[self.read_token()] = 10.0
+        lg[self.out[len(self.seq) - 1]] = 10.0
         return lg
