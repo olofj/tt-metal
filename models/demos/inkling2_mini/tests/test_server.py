@@ -200,3 +200,17 @@ def test_pf_cache(tmp_path):
 
     bank, pf, stick = cache("v1-bank", "BANK"), cache("v1-pf", "PF"), cache("v2-stick", "STICK")
     assert pf_cache(bank, log=lambda s: None) == pf and pf_cache(pf) == pf and pf_cache(stick) == stick
+
+
+def test_greedy_thinking_budget_and_limits(srv):
+    """The one-step-ahead path with forced tokens, a token limit and a stop string."""
+    base, _, _ = srv
+    body = {"messages": USER, "temperature": 0}
+    r = json.loads(post(base + "/v1/chat/completions", dict(body, thinking_budget_tokens=2))[1])
+    assert r["choices"][0]["message"]["reasoning_content"] == "The user"
+    assert r["choices"][0]["message"]["content"] == "Hello! I am a stub, not the model."
+    for n in (1, 2, 3):
+        r = json.loads(post(base + "/v1/chat/completions", dict(body, max_tokens=n))[1])
+        assert r["choices"][0]["finish_reason"] == "length" and r["usage"]["completion_tokens"] == n
+    r = json.loads(post(base + "/v1/chat/completions", dict(body, stop=["stub"]))[1])
+    assert r["choices"][0]["message"]["content"] == "Hello! I am a "
