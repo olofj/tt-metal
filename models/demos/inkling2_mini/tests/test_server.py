@@ -219,6 +219,8 @@ def test_pf_cache(tmp_path):
 
     bank, pf, stick = cache("v1-bank", "BANK"), cache("v1-pf", "PF"), cache("v2-stick", "STICK")
     assert pf_cache(bank, log=lambda s: None) == pf and pf_cache(pf) == pf and pf_cache(stick) == stick
+    tile, pf2 = cache("own2-def-tile", "TILE"), cache("own2-def-pf", "PF")  # dashed base names keep their dashes
+    assert pf_cache(tile, log=lambda s: None) == pf2
 
 
 def test_greedy_thinking_budget_and_limits(srv):
