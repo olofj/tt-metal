@@ -73,6 +73,7 @@ class TTRunner:
             self.ttnn.close_device(self.dev)
             raise
         self.out = None
+        self.pos_ready = None  # position whose inputs are already written
         host = lambda: ttnn.from_torch(torch.zeros(1, 1, 1, 1, dtype=torch.int32), dtype=ttnn.uint32)  # noqa: E731
         self.slots = [[host(), None, -1] for _ in range(2)]  # [host token, event, pos]
 
@@ -128,10 +129,18 @@ class TTRunner:
     def reset(self):
         self.model.reset()
 
-    def _run(self, pos, read):
+    def _run(self, pos, token, read):
+        """Inputs (token: None = the head's argmax already in place), replay, argmax read; then the next position's
+        inputs, so the host writes them while this step runs (the queue keeps them behind it)."""
         from models.demos.inkling2_mini.tt.fused.conv import FusedShortConv
 
-        ttnn, ph = self.ttnn, pos % FusedShortConv.PHASES
+        ttnn, m, ph = self.ttnn, self.model, pos % FusedShortConv.PHASES
+        m.phase = ph
+        if token is not None:
+            t = ttnn.from_torch(torch.tensor([[token]], dtype=torch.int32), dtype=ttnn.uint32)
+            ttnn.copy_host_to_device_tensor(t, m.tokens)
+        if pos != self.pos_ready:
+            m.positions.update(pos)
         ttnn.execute_trace(self.dev, self.gen.trace[ph], cq_id=0, blocking=False)
         self.out = self.gen.out[ph]
         if read:
@@ -140,17 +149,17 @@ class TTRunner:
                 ttnn.event_synchronize(s[1])  # the slot's last read has landed before it is read into again
             ttnn.copy_device_to_host_tensor(self.out["token"], s[0], blocking=False, cq_id=0)
             s[1], s[2] = ttnn.record_event(self.dev, cq_id=0), pos
+        self.pos_ready = pos + 1 if pos + 1 < self.max_ctx else None
+        if self.pos_ready is not None:
+            m.positions.update(self.pos_ready)
 
     def feed(self, token, pos, read=True):
-        self.model.set_inputs(token, pos)
-        self._run(pos, read)
+        self._run(pos, token, read)
 
     def feed_next(self, pos):
         if not self.chain:
             return self.feed(self.token_at(pos - 1), pos)
-        self.model.phase = pos % len(self.gen.trace)
-        self.model.positions.update(pos)
-        self._run(pos, True)
+        self._run(pos, None, True)
 
     def token_at(self, pos):
         s = self.slots[pos % 2]
