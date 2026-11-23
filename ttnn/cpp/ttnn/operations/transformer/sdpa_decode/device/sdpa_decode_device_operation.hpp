@@ -132,6 +132,8 @@ Tensor sdpa_decode(
     std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry = std::nullopt,
     std::optional<uint32_t> cache_position_modulo = std::nullopt,
     uint32_t spec_multi_pos_tiles = 0,
-    const std::optional<tt::tt_metal::ProgramDescriptor>& extra_kernels = std::nullopt);
+    const std::optional<tt::tt_metal::ProgramDescriptor>& extra_kernels = std::nullopt,
+    const std::optional<const Tensor>& pending_kv = std::nullopt,
+    const std::optional<const Tensor>& pending_pos = std::nullopt);
 
 }  // namespace ttnn::prim
