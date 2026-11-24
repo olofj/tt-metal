@@ -87,23 +87,75 @@ def test_info_endpoints(srv):
     assert json.loads(post(base + "/v1/streams/lookup", {"conversation_ids": ["x"]})[1]) == []
 
 
-def test_garbage_request_line(srv, capsys):
-    """A request that fails to parse (here a TLS hello on the plain-HTTP port) gets a 400 and logs one line."""
+def _raw(base, data):
+    """Send raw bytes, return everything the server sends back before it closes."""
     import socket
 
-    base, _, _ = srv
     host, port = base[len("http://") :].split(":")
-    capsys.readouterr()
     with socket.create_connection((host, int(port)), timeout=10) as s:
-        s.sendall(b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03 garbage\r\n\r\n")
+        s.sendall(data)
         reply = b""
         while chunk := s.recv(4096):
             reply += chunk
+    return reply
+
+
+TLS_HELLO = b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03 garbage\r\n\r\n"
+
+
+def test_garbage_request_line(srv, capsys):
+    """A request line that fails to parse gets a 400 and logs one line."""
+    base, _, _ = srv
+    capsys.readouterr()
+    reply = _raw(base, b"GET / HTTP/9 junk\r\n\r\n")
     assert b" 400 " in reply.split(b"\r\n", 1)[0]
     err = capsys.readouterr().err
     assert "Traceback" not in err and "AttributeError" not in err
     assert [line for line in err.splitlines() if line.startswith("- - ")] == ["- - 400"]
     assert get(base + "/health")[0] == 200
+
+
+def test_tls_on_http_port(srv, capsys):
+    """A browser speaking HTTPS to the plain-HTTP port: closed quietly, one hint line per client."""
+    base, _, _ = srv
+    capsys.readouterr()
+    for _ in range(3):  # browsers retry in bursts
+        assert _raw(base, TLS_HELLO) == b""
+    err = capsys.readouterr().err
+    port = base.rsplit(":", 1)[1]
+    assert err.splitlines() == [f"127.0.0.1: a client spoke HTTPS; open http://127.0.0.1:{port}/ instead"]
+    assert get(base + "/health")[0] == 200
+
+
+def test_loading_page(tok, tmp_path):
+    """While the model loads: GET / is a page with the startup progress, /health a 503 that says the same."""
+    from models.demos.inkling2_mini.server.chat import SpecialIds
+    from models.demos.inkling2_mini.server.engine import Engine
+    from models.demos.inkling2_mini.server.server import App, serve
+
+    class Progress:  # what server.startup.Startup.line() returns
+        def line(self):
+            return "startup: weights: tensors 432/999, 13.5/24.7 GB; 18 s in phase, 21 s total, eta 15 s"
+
+    (tmp_path / "index.html").write_text("<html>ui</html>")
+    engine = Engine(lambda: None, tok, SpecialIds(tok), log=lambda s: None)  # never started: loading
+    for ui in (tmp_path, None):
+        app = App(engine, tok, ui_dir=ui)
+        app.startup = Progress()
+        httpd = serve(app, "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            st, b = get(base + "/")
+            assert st == 200 and b"loading: weights: tensors 432/999, 13.5/24.7 GB" in b and b"refresh" in b
+            st, b = get(base + "/health")
+            assert st == 503 and "weights: tensors 432/999" in json.loads(b)["error"]["message"]
+            engine.ready.set()  # loaded: the UI itself
+            if ui is not None:
+                assert get(base + "/")[1] == b"<html>ui</html>"
+            engine.ready.clear()
+        finally:
+            httpd.shutdown()
 
 
 def test_non_stream(srv):

@@ -16,6 +16,7 @@ Single user: requests queue and run one at a time on one worker thread. No CORS 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import mimetypes
 import os
@@ -44,6 +45,24 @@ class App:
         self.chat_template = chat_template
         self.max_tokens_default = max_tokens_default
         self.started = int(time.time())
+        self.startup = None  # server.startup.Startup while the model loads: its progress for /health and GET /
+        self._tls_seen, self._tls_lock = set(), threading.Lock()
+
+    def loading_status(self):
+        """'weights: tensors 432/999, 13.5/24.7 GB; ...' while loading (or 'starting')."""
+        st = self.startup
+        line = st.line() if st is not None else None
+        return line.removeprefix("startup: ") if line else "starting"
+
+    def tls_hint(self, client, host, port):
+        """One line per client address that sent a TLS hello to this plain-HTTP port; True the first time."""
+        with self._tls_lock:
+            if client in self._tls_seen:
+                return False
+            self._tls_seen.add(client)
+        host = "<this machine>" if host in ("0.0.0.0", "::", "") else host
+        sys.stderr.write(f"{client}: a client spoke HTTPS; open http://{host}:{port}/ instead\n")
+        return True
 
     # ------------------------------------------------------------ GET bodies
     def model_info(self):
@@ -174,6 +193,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_error(self, fmt, *args):  # send_error logs the reason, then the response line: keep the latter
         pass
 
+    def parse_request(self):
+        # a TLS ClientHello (record type 0x16) on this plain-HTTP port: a browser trying https://. An HTTP reply
+        # means nothing to it, so close quietly; the hint is logged once per client (browsers retry in bursts).
+        if self.raw_requestline[:1] == b"\x16":
+            self.close_connection = True
+            host, port = self.server.server_address[:2]
+            self.app.tls_hint(self.client_address[0], host, port)
+            return False
+        return super().parse_request()
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
         self.send_response(code)
@@ -191,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, error_body(500, e.error, "server_error"))
             return True
         if not e.ready.is_set():
-            self._send(503, error_body(503, "Loading model", "unavailable_error"))
+            self._send(503, error_body(503, f"Loading model ({self.app.loading_status()})", "unavailable_error"))
             return True
         return False
 
@@ -216,8 +245,24 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._static(path)
 
+    def _loading_page(self):
+        """While the model loads: a page with the startup progress that reloads itself (then the UI)."""
+        status = html.escape(self.app.loading_status())
+        page = (
+            '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">'
+            f'<title>{MODEL_ID}: loading</title></head><body style="font-family:sans-serif;margin:2em">'
+            f"<h2>{MODEL_ID}</h2><p>loading: {status}</p><p>This page reloads until the model is ready.</p>"
+            "</body></html>"
+        )
+        self._send(200, page.encode(), "text/html; charset=utf-8", {"Cache-Control": "no-cache"})
+
     def _static(self, path):
         root = self.app.ui_dir
+        if root is None and path in ("", "/", "/index.html"):
+            e = self.app.engine
+            if not e.ready.is_set() and not e.error:
+                self._loading_page()
+                return
         if root is None:
             self._send(
                 404,
@@ -226,6 +271,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        e = self.app.engine
+        if rel == "index.html" and not e.ready.is_set() and not e.error:
+            self._loading_page()
+            return
         f = (root / rel).resolve()
         if root not in f.parents or not f.is_file():
             self._send(404, b"not found\n", "text/plain; charset=utf-8")
@@ -453,6 +502,7 @@ def main(argv=None):
         chat_template=tmpl.read_text() if tmpl.is_file() else "",
         max_tokens_default=a.max_tokens,
     )
+    app.startup = st
     httpd = serve(app, a.host, a.port)
     url = f"http://{a.host}:{a.port}/"
     log(f"listening on {url} (UI: {a.ui_dir or 'none'}); loading the model (/health answers 503 until it is ready)")
