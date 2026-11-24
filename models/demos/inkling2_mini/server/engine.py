@@ -71,9 +71,10 @@ class TTRunner:
     # 0.84, measured 0.30, 0.59, 0.83).
     # A draft with top probability p is right about SPEC_ACC(p) of the time (the drafter is overconfident), scaled
     # per request by (accepted drafts + n0 s0) / (expected by SPEC_ACC + n0) over the drafts whose row was
-    # reached: SPEC_PRIOR = (n0, s0 greedy, s0 sampled). The row count of a pass is the one with the most
-    # expected tokens per step; the draft is paid by then, so no draft is verified unless that beats one plain
-    # step.
+    # reached: SPEC_PRIOR = (n0, s0 greedy, s0 sampled). The row count k of a pass is the one with the most
+    # (expected tokens) - (cost): the draft is paid by then in every case, so verifying costs SPEC_COST[k] -
+    # SPEC_COST[0] more than the plain step, and a first draft is verified when it is right more often than that
+    # (0.40 at 4K, 0.32 at 128K).
     # Each draft books (tokens gained) - (its cost). Drafting may not cost a request more than SPEC_DEBT[0] +
     # SPEC_DEBT[1] x (its plain steps) over plain steps (not counted before SPEC_DEBT[2] drafts: one failed pass
     # says little): below that the request runs plain steps. It then tries one draft every SPEC_PROBE[0] steps,
@@ -83,8 +84,8 @@ class TTRunner:
     SPEC_COST = (0.35, 0.75, 1.05)
     SPEC_FAR = (0.1, 0.38)
     SPEC_PRIOR = (6.0, 1.0, 0.95)
-    SPEC_DEBT = (0.7, 0.002, 4)
-    SPEC_PROBE = (8, 128, 0.7)
+    SPEC_DEBT = (1.5, 0.002, 6)
+    SPEC_PROBE = (8, 32, 1.0)
 
     @staticmethod
     def SPEC_ACC(p):
@@ -399,7 +400,7 @@ class TTRunner:
             a1 = self._acc(pr[0])
             exp = [1.0, 1.0 + a1] + ([1.0 + a1 + a1 * self._acc(pr[1])] if kmax > 1 else [])
             cost = self._cost(pos)
-            k = max(range(len(exp)), key=lambda i: exp[i] / (1.0 + cost[i] if i else 1.0))
+            k = max(range(len(exp)), key=lambda i: exp[i] - cost[i])
         elif self.spec_early is not None:
             t1, t2 = self.spec_early
             k = 0 if pr[0] < t1 else 1 if kmax < 2 or pr[0] * pr[1] < t2 else 2
