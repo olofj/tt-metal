@@ -57,34 +57,47 @@ defaults in both modes, with the loop gate messages stored bf16 (`INKLING_PF_GAT
 ## Speculative decode (off by default)
 
 A small drafter proposes 2 tokens, one verify pass checks them with the full model, and the accepted ones are kept.
-The tokens are the same as plain greedy decode; text the drafter predicts well comes out faster.
+The tokens are the same as plain decode; text the drafter predicts well comes out faster.
 
 | where | how |
 |---|---|
-| chat server | `--spec` or `INKLING_SPEC=1`: greedy requests (`temperature` 0). Sampled requests run the plain step |
+| chat server | `--spec` or `INKLING_SPEC=1`: greedy and sampled requests |
 | demo | `--spec` or `INKLING_SPEC=1`: each prompt also runs through spec decode; prints `spec_equals_plain`, tok/s |
 | code | `tt/spec_generator.py`: `SpecGenerator.generate_rows`, `generate_rows_from` |
 
 It needs the drafter weights: `python -m models.demos.inkling2_mini.convert.mtp` writes them once to
 `<cache dir>/mtp`, where both run modes find them (`$INKLING_MTP_CACHE` points elsewhere).
 
-Served tok/s (the server's `timings`, one card, greedy, replies equal to the plain server's in every row):
+Sampled requests: the model's token of each verify row is one sampler draw on that row's logits, and a draft is
+kept only when the draw is that token. That is speculative sampling with a proposal that puts all its mass on the
+draft (accept with probability p(draft), else draw from p without the draft), so the reply has the plain sampler's
+distribution. The draws are the plain path's draws one for one: the same `seed` gives the same reply with and
+without `--spec`.
+
+Served tok/s at 4K (the server's `timings`, one card, 300 tokens unless noted; replies equal to the plain server's
+in every row, sampled rows by seed). Sampled = `temperature` 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05.
 
 | request | default | default `--spec` | fast | fast `--spec` |
 |---|---:|---:|---:|---:|
-| 4K: one-sentence answer, 58 tokens | 66.9 | 85.9 | 75.0 | 94.7 |
-| 4K: Python function, 300 tokens | 68.5 | 78.7 | 76.9 | 89.6 |
-| 4K: short story, 300 tokens | 68.6 | 64.4 | 76.9 | 73.5 |
-| 4K: short story with reasoning, 300 tokens | 68.4 | 66.0 | 76.9 | 74.3 |
-| 4K: sampled (T 0.8), 200 tokens | 63.3 | 62.0 | 70.3 | 69.0 |
-| 4K: prompt feed | 68.1 | 64.7 | 76.2 | 72.8 |
-| 128K context: continue the text, 192 tokens | 49.8 | 58.2 | 54.1 | 56.4 |
-| 128K context: question about the text, 48 tokens | 50.5 | 62.7 to 72.1 | 54.9 | 80.0 to 80.3 |
+| one-sentence answer (58 tokens), greedy | 66.9 | 83.2 | 75.1 | 86.3 |
+| one-sentence answer, sampled | 62.4 | 77.6 | 70.0 | 88.0 |
+| Python function, greedy | 68.5 | 81.0 | 76.9 | 91.3 |
+| Python function, sampled | 63.1 | 75.7 | 70.2 | 88.6 |
+| short story, greedy | 68.6 | 66.2 | 76.9 | 74.4 |
+| short story, sampled | 63.2 | 62.3 | 70.5 | 69.7 |
+| short story, `temperature` 1, full vocab | 63.5 | 63.2 | 71.6 | 70.5 |
+| short story with reasoning, greedy | 68.4 | 66.1 | 76.9 | 74.3 |
+| prompt feed | 68.1 | 66.1 | 76.2 | 74.5 |
 
-- With `--spec` every step also keeps the drafter's context up to date and the expert prefetch is off (it does not
-  fit in L1 beside the drafter), so the plain step is ~5 % slower: the prompt feed, sampled requests and text the
-  drafter can not predict (the story) lose that much. When drafts stop paying off the server runs plain steps for a
-  while and tries again.
+At 128K context (greedy, before the stash steps and the sampled passes): continue the text 49.8 -> 58.2 tok/s
+(fast 54.1 -> 56.4), a question about the text 50.5 -> 62.7 to 72.1 (fast 54.9 -> 80.0 to 80.3).
+
+- With `--spec` the plain step is ~3 % slower (15.13 against 14.68 ms at 4K): the expert prefetch is off (0.29 ms;
+  its L1 ring does not fit beside the drafter) and the step keeps the drafter's context up to date (0.15 ms, by
+  stashing its taps and committing four positions at once). The prompt feed and text the drafter can not predict
+  (the story) lose that much.
+- Drafting may cost a request at most 1.3 plain steps + 0.4 % over plain steps: beyond that the request runs
+  plain steps and tries a draft again now and then.
 - A thinking budget turns spec off until the budget is used (the forced tokens must follow an exact token).
 - DRAM: the drafter context takes 12,288 B per token of `--max-ctx` beside the far KV's 19,584. 3-row passes fit up
   to about 142K tokens in default mode (276K in fast mode), 2-row passes to about 151K (286K); the server picks
