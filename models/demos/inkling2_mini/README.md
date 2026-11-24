@@ -73,30 +73,30 @@ Sampled requests: the model's token of each verify row is one sampler draw on th
 kept only when the draw is that token. That is speculative sampling with a proposal that puts all its mass on the
 draft (accept with probability p(draft), else draw from p without the draft), so the reply has the plain sampler's
 distribution. The draws are the plain path's draws one for one: the same `seed` gives the same reply with and
-without `--spec`.
+without it.
 
-Served tok/s at 4K (the server's `timings`, one card, 300 tokens unless noted; replies equal to the plain server's
-in every row, sampled rows by seed). Sampled = `temperature` 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05.
+Served tok/s (the server's `timings`, one card, 300 tokens unless noted; replies equal to the `--no-spec`
+server's in every row, sampled rows by seed). Sampled = `temperature` 0.8, `top_k` 40, `top_p` 0.95, `min_p` 0.05.
+128K and 192K rows: the decode state at the end of a prefilled prompt is loaded into the server's engine (the
+server itself feeds a prompt token by token).
 
-| request | default | default `--spec` | fast | fast `--spec` |
+| request | default `--no-spec` | default | fast `--no-spec` | fast |
 |---|---:|---:|---:|---:|
-| one-sentence answer (58 tokens), greedy | 66.9 | 83.2 | 75.1 | 86.3 |
-| one-sentence answer, sampled | 62.4 | 77.6 | 70.0 | 88.0 |
-| Python function, greedy | 68.5 | 81.0 | 76.9 | 91.3 |
-| Python function, sampled | 63.1 | 75.7 | 70.2 | 88.6 |
-| short story, greedy | 68.6 | 66.2 | 76.9 | 74.4 |
-| short story, sampled | 63.2 | 62.3 | 70.5 | 69.7 |
-| short story, `temperature` 1, full vocab | 63.5 | 63.2 | 71.6 | 70.5 |
-| short story with reasoning, greedy | 68.4 | 66.1 | 76.9 | 74.3 |
-| prompt feed | 68.1 | 66.1 | 76.2 | 74.5 |
+| 4K: one-sentence answer (58 tokens), greedy | 66.9 | 83.2 | 75.0 | 95.0 |
+| 4K: one-sentence answer, sampled | 62.7 | 76.4 | 70.0 | 85.9 |
+| 4K: Python function, greedy | 68.5 | 80.6 | 76.9 | 91.4 |
+| 4K: Python function, sampled | 63.2 | 75.9 | 70.3 | 87.7 |
+| 4K: short story, greedy | 68.6 | 66.9 | 76.9 | 75.4 |
+| 4K: short story, sampled | 63.3 | 63.0 | 70.4 | 70.4 |
+| 4K: prompt feed | 68.1 | 67.5 | 76.2 | 75.6 |
+| 128K: continue the text (192 tokens), greedy | 49.8 | 58.7 | 54.1 | 57.5 |
+| 128K: continue the text, sampled | 46.8 | 54.7 | 50.9 | 49.6 |
+| 128K: a question about the text (48 tokens), greedy | 50.5 | 62.5 to 73.1 | 54.9 | 74.3 to 80.9 |
+| 192K: continue the text, greedy (plain steps: above 143,360) | 43.7 | 43.7 | 47.2 | 47.2 |
 
-At 128K context (greedy, before the stash steps and the sampled passes): continue the text 49.8 -> 58.2 tok/s
-(fast 54.1 -> 56.4), a question about the text 50.5 -> 62.7 to 72.1 (fast 54.9 -> 80.0 to 80.3).
-
-- With `--spec` the plain step is ~3 % slower (15.13 against 14.68 ms at 4K): the expert prefetch is off (0.29 ms;
-  its L1 ring does not fit beside the drafter) and the step keeps the drafter's context up to date (0.15 ms, by
-  stashing its taps and committing four positions at once). The prompt feed and text the drafter can not predict
-  (the story) lose that much.
+- With spec decode the plain step is under 1 % slower (the prompt feed row): the step keeps the drafter's context
+  up to date, by stashing its taps and committing eight positions at once. Text the drafter can not predict
+  (the story) also pays for the drafts that are tried on it.
 - Drafting may cost a request at most 1.3 plain steps + 0.4 % over plain steps: beyond that the request runs
   plain steps and tries a draft again now and then.
 - A thinking budget turns spec off until the budget is used (the forced tokens must follow an exact token).
@@ -104,9 +104,10 @@ At 128K context (greedy, before the stash steps and the sampled passes): continu
   `INKLING_SPEC_MAX_CTX`) and runs plain steps from there on, at the plain server's speed and with the same
   tokens; a reply that crosses the position goes on without a pause. The drafter keeps 4,608 B of DRAM per
   position below it (two of its three layers read the last 1,032 positions only and keep rings), beside the far
-  KV's 19,584 B per token of `--max-ctx`. At `--max-ctx 196608` in default mode that leaves room for 3-row
-  passes; when DRAM is short for the drafter and a verify step the server says so at start and runs without
-  spec decode.
+  KV's 19,584 B per token of `--max-ctx`. At `--max-ctx 196608` in default mode the server runs 3-row passes
+  and 0.87 GiB of DRAM stays free (2.84 with `--no-spec`; fast mode 4.7 against 6.6). When DRAM is short for the
+  drafter and a verify step (default mode: above about 250K) the server says so at start and runs without spec
+  decode.
 
 A chunked prefill (`tt/prefill_model.py`; the server does not use it) gives the drafter no context for the prompt
 unless it is told to: set `Inkling2Prefill.drafter = <the DSparkDrafter>` before `prefill()` and every chunk also
