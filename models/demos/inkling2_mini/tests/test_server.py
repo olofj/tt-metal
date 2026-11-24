@@ -300,8 +300,9 @@ class _RandomRunner:
     tokens (64 live tokens, one of them a stop token). spec_pass as engine.TTRunner.spec_pass: the drafts are the
     argmax tokens, every 4th one wrong."""
 
-    def __init__(self, vocab, stop, max_ctx=512, spec=False):
+    def __init__(self, vocab, stop, max_ctx=512, spec=False, spec_ctx=None):
         self.vocab, self.max_ctx, self.spec, self.spec_sampled = vocab, max_ctx, spec, spec
+        self.spec_ctx, self.top = spec_ctx or max_ctx, 0  # passes below spec_ctx only; top = the highest pass
         self.live = torch.tensor(list(range(100, 163)) + [stop])
         self.seq, self.n_draft, self.passes, self.kept = [], 0, 0, 0
 
@@ -331,10 +332,11 @@ class _RandomRunner:
         pass
 
     def spec_ready(self):
-        return True
+        return len(self.seq) < self.spec_ctx
 
     def spec_pass(self, token, pos, max_rows, stop=(), sampler=None):
-        assert pos == len(self.seq)
+        assert pos == len(self.seq) and pos < self.spec_ctx
+        self.top = max(self.top, pos)
         k = min(2, max_rows - 1)
         if k < 1 or pos % 5 == 4:
             return None
@@ -365,8 +367,8 @@ def test_spec_sampled_engine(tok):
     sp = SpecialIds(tok)
     stop = sorted(sp.stop)[0]
 
-    def run(spec, raw):
-        runner = _RandomRunner(len(tok), stop, spec=spec)
+    def run(spec, raw, spec_ctx=None):
+        runner = _RandomRunner(len(tok), stop, spec=spec, spec_ctx=spec_ctx)
         engine = Engine(lambda: runner, tok, sp, log=lambda s: None).start()
         engine.ready.wait(10)
         out = []
@@ -389,4 +391,7 @@ def test_spec_sampled_engine(tok):
         (plain, _), (spec, r) = run(False, raw), run(True, raw)
         assert plain == spec
         assert r.passes > 100 and 0.2 < r.kept / (2 * r.passes) < 0.9, (r.passes, r.kept)
+        # passes below position 20 only, plain steps from there on (the drafter's positions end inside the reply)
+        cross, rc = run(True, raw, spec_ctx=20)
+        assert plain == cross and 0 < rc.passes < r.passes and rc.top == 19, (rc.passes, rc.top)
     assert len({p[0] for p in plain}) > 40 and any(p[3] == "stop" for p in run(False, False)[0])

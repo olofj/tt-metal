@@ -395,13 +395,19 @@ def main(argv=None):
     ap.add_argument("--exact-cache", action="store_true", help="load --cache as given, not its PF-layout twin")
     ap.add_argument(
         "--spec",
-        action="store_true",
-        default=os.environ.get("INKLING_SPEC") == "1",
-        help="speculative decode (also INKLING_SPEC=1): a small drafter proposes 2 tokens, one verify pass checks "
-        "them; the same tokens as without it, more tokens per second on text the drafter predicts. Sampled "
-        "requests too: a draft is kept when the sampler draws it, so a seeded reply is the same as without "
-        "--spec. Needs --max-ctx >= 4096 and the drafter weights "
-        "(convert.mtp); off by default",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("INKLING_SPEC") != "0",
+        help="speculative decode, on by default (--no-spec or INKLING_SPEC=0 turn it off): a small drafter "
+        "proposes 2 tokens, one verify pass checks them; the same tokens as without it, more tokens per second on "
+        "text the drafter predicts. Sampled requests too: a draft is kept when the sampler draws it, so a seeded "
+        "reply is the same as without it. Used below position --spec-max-ctx; plain steps from there on. Needs "
+        "--max-ctx >= 4096 and the drafter weights (convert.mtp), else it is off",
+    )
+    ap.add_argument(
+        "--spec-max-ctx",
+        type=int,
+        default=None,
+        help=f"speculative decode below this position (default {modes.SPEC_MAX_CTX}, also INKLING_SPEC_MAX_CTX)",
     )
     a = ap.parse_args(argv)
     if a.ckpt is None:
@@ -429,7 +435,9 @@ def main(argv=None):
         cache = a.cache if a.exact_cache else pf_cache(a.cache, log)
         early = os.environ.get("INKLING_SPEC_EARLY", "auto")  # tuning: "auto", "t1,t2" thresholds, or "none"
         early = None if early == "none" else early if early == "auto" else tuple(float(x) for x in early.split(","))
-        make = lambda: TTRunner(cache, a.max_ctx, log=log, spec=a.spec, spec_early=early)  # noqa: E731
+        make = lambda: TTRunner(  # noqa: E731
+            cache, a.max_ctx, log=log, spec=a.spec, spec_early=early, spec_ctx=a.spec_max_ctx
+        )
     engine = Engine(make, tok, special, log=log)
     tmpl = Path(a.ckpt, "chat_template.jinja")
     app = App(
