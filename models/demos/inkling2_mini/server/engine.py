@@ -64,23 +64,20 @@ class TTRunner:
     SPEC_K = 2  # drafts per pass: verify passes of 2 and 3 rows
     SPEC_MIN_CTX = 4096  # the verify traces are captured around position 1536
 
-    # Cost model of a pass, ms (p100a, both modes within 10 %): a plain step of this process takes PLAIN_MS[0] +
-    # PLAIN_MS[1] * position; a pass adds SPEC_EXTRA_MS[k] to it for k verified drafts (0: the draft alone, then a
-    # plain step). A draft with top probability p is right about SPEC_ACC(p) of the time (the drafter is
-    # overconfident; 4 chat requests, 498 passes). The row count of a pass is the one with the most expected
-    # tokens per ms. When the last SPEC_WINDOW passes took longer than plain steps would have for their tokens, the
-    # next SPEC_OFF[0] tokens run as plain steps (doubling up to SPEC_OFF[1] while it stays so).
-    PLAIN_MS = (15.6, 4.4e-5)
-    SPEC_EXTRA_MS = (3.9, 11.3, 14.8)
-    # Drafting may not cost a request more than SPEC_DEBT_MS[0] + SPEC_DEBT_MS[1] x (its plain steps' time) over
-    # plain steps: each pass books (its tokens x a plain step) - (its cost) by the model above; while the sum is
-    # below minus that allowance the request runs plain steps (they raise the allowance, so drafting is tried
-    # again later, ever more rarely on text the drafter can not predict).
-    SPEC_DEBT_MS = (20.0, 0.004)
-    # SPEC_ACC is scaled per request by (accepted drafts + n0 s0) / (expected by SPEC_ACC + n0), over the drafts
-    # whose row was reached: text and sampler settings shift how often a draft is the model's token. SPEC_PRIOR
-    # (n0, s0 greedy, s0 sampled).
-    SPEC_PRIOR = (6.0, 1.0, 0.8)
+    # Cost model of a pass, in plain steps of this process (p100a at 4K, default and fast mode within 0.03; the
+    # 128K passes of S8 / S9 give the same ratios): a draft alone costs SPEC_COST[0], a pass with k verified drafts
+    # 1 + SPEC_COST[k]. A draft with top probability p is right about SPEC_ACC(p) of the time (the drafter is
+    # overconfident), scaled per request by (accepted drafts + n0 s0) / (expected by SPEC_ACC + n0) over the drafts
+    # whose row was reached: SPEC_PRIOR = (n0, s0 greedy, s0 sampled). The row count of a pass is the one with the
+    # most expected tokens per step; the draft is paid by then, so no draft is verified unless that beats one
+    # plain step.
+    # Drafting may not cost a request more than SPEC_DEBT[0] + SPEC_DEBT[1] x (its plain steps) over plain steps:
+    # each pass books (its tokens) - (its cost); while the sum is below minus that allowance the request runs plain
+    # steps (they raise the allowance, so drafting is tried again later, ever more rarely on text the drafter can
+    # not predict).
+    SPEC_COST = (0.29, 0.70, 0.99)
+    SPEC_DEBT = (1.3, 0.004)
+    SPEC_PRIOR = (6.0, 1.0, 0.95)
 
     @staticmethod
     def SPEC_ACC(p):
@@ -102,8 +99,11 @@ class TTRunner:
         self.spec, self.spec_early, self.drafter = spec, spec_early, None
         self._vrow = None  # (verify outputs, row) when the last device step was a verify pass
         self.spec_begin()
+        # stash steps (TappedModel.stash): on = the group under way is stashed; pending = its positions so far
+        self._stash, self._pending, self._declined = False, 0, None
         self.vtail = {}  # verify row -> (tail trace, row pieces): the row's logits as fp32 rows (sampled passes)
-        self.spec_log = [] if os.environ.get("INKLING_SPEC_LOG") else None  # per pass: (pos, draft probs, k, a)
+        # tuning: per pass (pos, draft probs, k, a, start time, sampled), per plain step (pos, None, -1, stash, time)
+        self.spec_log = [] if os.environ.get("INKLING_SPEC_LOG") else None
         t0 = time.time()
         # spec: the draft, verify (per row count, conv phase, far-chunk case) and commit traces need more room
         self.dev = open_device(trace_region_size=(trace_mib or (1024 if spec else 512)) << 20)
@@ -137,7 +137,8 @@ class TTRunner:
                 # the verify steps that fit in DRAM at this max_ctx (3-row passes need 0.28 GiB more)
                 free = dram_free_gib(self.dev)
                 rows = verify_rows(self.dev, max_ctx)
-                self.gen = SpecGenerator(m, d, verify=[VerifyStep(m, r) for r in rows])
+                stash = os.environ.get("INKLING_SPEC_STASH", "1") == "1"  # tuning: 0 = every step commits
+                self.gen = SpecGenerator(m, d, verify=[VerifyStep(m, r) for r in rows], stash=stash)
 
                 # the tails of the verify rows' logits are compiled before any capture, like every other program
                 def row_tails():
@@ -153,7 +154,8 @@ class TTRunner:
             else:
                 self.gen = Generator(m)
                 self.gen.capture()
-            if tail and all(o["logits"].buffer_address() == lg.buffer_address() for o in self.gen.out):
+            outs = self.gen.out + (getattr(self.gen, "sout", None) or [])
+            if tail and all(o["logits"].buffer_address() == lg.buffer_address() for o in outs):
                 self.tail = self._capture_tail(lg)
             if spec and self.tail is not None:
                 self._capture_vtails(lg, max(rows))
@@ -255,24 +257,24 @@ class TTRunner:
 
     def reset(self):
         self.model.reset()
+        self._stash, self._pending = False, 0
 
     def spec_begin(self, sampled=False):
         """A new request: its drafting account and its accept scale start over."""
-        self._bal = self._plain_ms = 0.0
+        self._bal, self._steps = 0.0, 0
         self._hit, self._exp = self.SPEC_PRIOR[0] * self.SPEC_PRIOR[2 if sampled else 1], self.SPEC_PRIOR[0]
 
     def spec_ready(self):
         if os.environ.get("INKLING_SPEC_GATE") == "0":  # tuning: never turn drafting off
             return True
-        return self._bal >= -(self.SPEC_DEBT_MS[0] + self.SPEC_DEBT_MS[1] * self._plain_ms)
+        return self._bal >= -(self.SPEC_DEBT[0] + self.SPEC_DEBT[1] * self._steps)
 
     def _acc(self, p):
         return min(0.97, self.SPEC_ACC(p) * self._hit / self._exp)
 
-    def _spec_note(self, k, a, pr, pos):
+    def _spec_note(self, k, a, pr):
         """One pass done: k drafts verified, the first a of them kept (draft a, if any, was not the model's)."""
-        plain = self.PLAIN_MS[0] + self.PLAIN_MS[1] * pos
-        self._bal += (a + 1) * plain - (plain + self.SPEC_EXTRA_MS[k])
+        self._bal += a - self.SPEC_COST[k]
         for i in range(min(k, a + 1)):
             self._exp += self.SPEC_ACC(pr[i])
             self._hit += i < a
@@ -284,14 +286,30 @@ class TTRunner:
 
         ttnn, m, ph = self.ttnn, self.model, pos % FusedShortConv.PHASES
         m.phase = ph
+        tr, outs = self.gen.trace, self.gen.out
+        if getattr(self.gen, "strace", None):
+            # a plain step that is not the fallback of a declined pass is one of a run (prompt feed, drafting off):
+            # it stashes its drafter taps, from the next group start on (TappedModel.stash)
+            run = self._declined != pos
+            if not run:
+                self._flush()
+            elif self._pending == 0:
+                self._stash = ph == 0
+                if self._stash:
+                    self.drafter.set_stash_pos(pos)
+            if self._stash:
+                tr, outs = self.gen.strace, self.gen.sout
+                self._pending = (ph + 1) % len(tr)  # the last slot's step commits the group
         if token is not None:
             t = ttnn.from_torch(torch.tensor([[token]], dtype=torch.int32), dtype=ttnn.uint32)
             ttnn.copy_host_to_device_tensor(t, m.tokens)
         if pos != self.pos_ready:
             self._positions(pos)
-        ttnn.execute_trace(self.dev, self.gen.trace[ph], cq_id=0, blocking=False)
-        self.out, self._vrow = self.gen.out[ph], None
-        self._plain_ms += self.PLAIN_MS[0] + self.PLAIN_MS[1] * pos
+        if self.spec_log is not None:
+            self.spec_log.append((pos, None, -1, int(self._stash), time.perf_counter()))
+        ttnn.execute_trace(self.dev, tr[ph], cq_id=0, blocking=False)
+        self.out, self._vrow = outs[ph], None
+        self._steps += 1
         if read:
             s = self.slots[pos % 2]
             if s[1] is not None:
@@ -301,6 +319,12 @@ class TTRunner:
         self.pos_ready = pos + 1 if pos + 1 < self.max_ctx else None
         if self.pos_ready is not None:
             self._positions(self.pos_ready)
+
+    def _flush(self):
+        """Commit the stashed positions of a group cut short (before a draft, or a committing step)."""
+        if self._pending:
+            self.ttnn.execute_trace(self.dev, self.gen.ftrace[self._pending], cq_id=0, blocking=False)
+        self._stash, self._pending = False, 0
 
     def _positions(self, pos):
         self.model.positions.update(pos)
@@ -312,11 +336,14 @@ class TTRunner:
         verify pass over token + drafts, the model's tokens (read, or sampled row by row), and the commit of the
         accepted rows."""
         ttnn, g, d = self.ttnn, self.gen, self.drafter
+        t0 = time.perf_counter()
         kmax = min(max(g.verifies) - 1, max_rows - 1, self.max_ctx - 1 - pos)
         if sampler is not None:
             kmax = min(kmax, len(self.vtail) - 1)
         if kmax < 1 or pos < 1:
+            self._declined = pos
             return None
+        self._flush()
         if self.slots[(pos - 1) % 2][1] is not None:  # a queued token read of the step before: done before new work
             ttnn.event_synchronize(self.slots[(pos - 1) % 2][1])
         # the first draft's anchor: `token` (after a plain step or a pass it is there already; not after a reuse)
@@ -330,18 +357,18 @@ class TTRunner:
         k = kmax
         pr = ttnn.to_torch(d.probs).float()[0, 0, 0, :kmax].tolist()
         if self.spec_early == "auto":
-            plain = self.PLAIN_MS[0] + self.PLAIN_MS[1] * pos
             a1 = self._acc(pr[0])
             exp = [1.0, 1.0 + a1] + ([1.0 + a1 + a1 * self._acc(pr[1])] if kmax > 1 else [])
-            k = max(range(len(exp)), key=lambda i: exp[i] / (plain + self.SPEC_EXTRA_MS[i]))
+            k = max(range(len(exp)), key=lambda i: exp[i] / (1.0 + self.SPEC_COST[i] if i else 1.0))
         elif self.spec_early is not None:
             t1, t2 = self.spec_early
             k = 0 if pr[0] < t1 else 1 if kmax < 2 or pr[0] * pr[1] < t2 else 2
         self.pos_ready = None  # the verify steps wrote their own position inputs
         if k == 0:
             if self.spec_log is not None:
-                self.spec_log.append((pos, pr, 0, 0))
-            self._spec_note(0, 0, pr, pos)
+                self.spec_log.append((pos, pr, 0, 0, t0, sampler is not None))
+            self._spec_note(0, 0, pr)
+            self._declined = pos
             return None
         rows, ph = k + 1, pos % 4
         tid, out = g.vtrace[(rows, ph, g._shared(pos, rows))]
@@ -371,9 +398,9 @@ class TTRunner:
                     ttnn.execute_trace(self.dev, self.vtail[a + 1][0], cq_id=0, blocking=False)
         ttnn.execute_trace(self.dev, g.ctrace[(rows, ph, a + 1)], cq_id=0, blocking=False)
         self.out, self._vrow = None, (out, a)
-        self._spec_note(k, a, pr, pos)
+        self._spec_note(k, a, pr)
         if self.spec_log is not None:
-            self.spec_log.append((pos, pr, k, a))
+            self.spec_log.append((pos, pr, k, a, t0, sampler is not None))
         return tgt
 
     def _vrow_logits(self, r):
