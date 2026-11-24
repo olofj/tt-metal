@@ -45,6 +45,7 @@ turn with it), so the reuse below still holds.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -53,6 +54,26 @@ import time
 import torch
 
 from models.demos.inkling2_mini.server.chat import OutputParser
+
+
+def _weight_totals(cache, spec):
+    """Estimated tensors= and gb= of a start, from the manifests (the decode cache, the drafter's); {} if unreadable."""
+    from pathlib import Path
+
+    roots = [Path(cache)]
+    if spec:
+        from models.demos.inkling2_mini.tt.mtp import mtp_root
+
+        roots.append(mtp_root())
+    n, size = 0, 0
+    try:
+        for r in roots:
+            for e in json.loads((r / "manifest.json").read_text())["tensors"]:
+                n += 1
+                size += os.path.getsize(r / e["file"])
+    except (OSError, ValueError, KeyError):
+        return {}
+    return {"tensors": n, "gb": size / 1e9}
 
 
 class TTRunner:
@@ -94,14 +115,18 @@ class TTRunner:
     def SPEC_ACC(p):
         return 0.89 if p >= 0.9 else 0.95 * p * p
 
-    def __init__(self, cache, max_ctx, trace_mib=None, log=print, spec=False, spec_early="auto", spec_ctx=None):
+    def __init__(
+        self, cache, max_ctx, trace_mib=None, log=print, spec=False, spec_early="auto", spec_ctx=None, startup=None
+    ):
         """spec: speculative decode (tt/spec_generator.py): a drafter proposes SPEC_K tokens, one verify pass checks
         them; same tokens as the plain step. spec_ctx: passes below this position only (None: modes.spec_max_ctx());
         the steps from there on leave the drafter alone. When DRAM is short for the drafter and a verify step
         beside the model at this max_ctx, spec is off (logged), never the context. spec_early: how many drafts a
         pass verifies.
         "auto": by the cost model above; (t1, t2): draft 1 when its top probability is >= t1, draft 2 when the
-        product of both is >= t2; None: always SPEC_K."""
+        product of both is >= t2; None: always SPEC_K. startup: a server.startup.Startup for progress lines."""
+        phase = startup.phase if startup else lambda *a, **kw: None
+        phase("import ttnn")
         import ttnn
         from models.demos.inkling2_mini.tt.device import open_device
         from models.demos.inkling2_mini.tt.generator import Generator
@@ -137,9 +162,11 @@ class TTRunner:
         t0 = time.time()
         # spec: the draft, verify (per row count, conv phase, far-chunk case), commit, stash and quiet traces take
         # about 270 MiB of it (logged below), the plain server's 23
+        phase("open device")
         self.dev = open_device(trace_region_size=(trace_mib or 512) << 20)
         self.tail, self.tail_pieces = None, 0
         try:
+            phase("weights", **_weight_totals(cache, spec))
             m = None
             if spec:
                 from models.demos.inkling2_mini.tt.mtp import DSparkDrafter
@@ -162,6 +189,7 @@ class TTRunner:
                     self.spec = spec = m.tapping = False  # the plain model and server from here on
                     self.spec_ctx = max_ctx
             if spec:
+                phase("drafter")
                 d = self.drafter = m.drafter = DSparkDrafter(m, max_ctx=self.spec_ctx, k=self.SPEC_K)
                 d.head = d.make_head(ttnn.bfloat4_b)  # the drafts' own head copy (BFP4: 3.3 ms per draft pass)
                 d.top_probs = True
@@ -170,6 +198,7 @@ class TTRunner:
             self.model = m
             log(f"model loaded in {time.time() - t0:.0f} s")
             self.chain = self._alias_token(m)
+            phase("first step")  # compiles every decode program
             m.set_inputs(0, 0)
             lg = m.step()["logits"]  # compiles the step; the head's logits are a module buffer, the same in the traces
             tail = lg.layout == ttnn.TILE_LAYOUT and m.head_tail is not None
@@ -177,6 +206,7 @@ class TTRunner:
                 for k in self.TAIL_PIECES:  # compile every tail variant before any trace exists
                     for t in self._rows(lg, k):
                         ttnn.deallocate(t)
+            phase("traces")  # warm-up steps, then the captures (spec: verify programs compile here)
             if spec:
                 # the verify steps that fit in DRAM at this max_ctx (3-row passes need 0.28 GiB more)
                 free = dram_free_gib(self.dev)
@@ -199,6 +229,7 @@ class TTRunner:
                 self.gen = Generator(m)
                 self.gen.capture()
             outs = self.gen.out + (getattr(self.gen, "sout", None) or []) + (getattr(self.gen, "qout", None) or [])
+            phase("logits tails")
             if tail and all(o["logits"].buffer_address() == lg.buffer_address() for o in outs):
                 self.tail = self._capture_tail(lg)
             if spec and self.tail is not None:
@@ -215,12 +246,16 @@ class TTRunner:
                     f"{dram_free_gib(self.dev):.2f} now, {self._trace_mib():.0f} MiB of traces"
                 )
         except BaseException:
+            if startup:
+                startup.fail()
             self.ttnn.close_device(self.dev)
             raise
         self.out = None
         self.pos_ready = None  # position whose inputs are already written
         host = lambda: ttnn.from_torch(torch.zeros(1, 1, 1, 1, dtype=torch.int32), dtype=ttnn.uint32)  # noqa: E731
         self.slots = [[host(), None, -1] for _ in range(2)]  # [host token, event, pos]
+        if startup:
+            startup.done()
 
     def _trace_mib(self):
         v = self.ttnn.get_memory_view(self.dev, self.ttnn.BufferType.TRACE)
@@ -558,6 +593,7 @@ class Engine:
         self.ready = threading.Event()
         self._make = make_runner
         self.thread = None
+        self.on_ready = None  # called once the model is loaded
 
     def start(self):
         """run() on a new thread (stub runners only; the card runner runs on the main thread)."""
@@ -596,6 +632,8 @@ class Engine:
                 job.events.put(("error", self.error))
             return
         self.ready.set()
+        if self.on_ready:
+            self.on_ready()
         try:
             while (job := self.jobs.get()) is not None:
                 self.busy.set()

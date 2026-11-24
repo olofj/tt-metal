@@ -420,11 +420,17 @@ def main(argv=None):
         d = default_dir()
         a.ui_dir = str(d) if (d / "index.html").is_file() else None
 
+    log = lambda s: print(f"[inkling-server] {s}", flush=True)  # noqa: E731
+    from models.demos.inkling2_mini.server.startup import Startup
+
+    # progress lines while starting (the stub starts in a moment: none)
+    st = None if a.fake else Startup(log, key=f"{a.cache}|{a.max_ctx}|{a.spec}|{a.spec_max_ctx}|{a.exact_cache}")
+    if st:
+        st.phase("tokenizer")
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.ckpt)
     special = SpecialIds(tok)
-    log = lambda s: print(f"[inkling-server] {s}", flush=True)  # noqa: E731
     if a.fake:
         from models.demos.inkling2_mini.server.fake import EchoRunner
 
@@ -436,7 +442,7 @@ def main(argv=None):
         early = os.environ.get("INKLING_SPEC_EARLY", "auto")  # tuning: "auto", "t1,t2" thresholds, or "none"
         early = None if early == "none" else early if early == "auto" else tuple(float(x) for x in early.split(","))
         make = lambda: TTRunner(  # noqa: E731
-            cache, a.max_ctx, log=log, spec=a.spec, spec_early=early, spec_ctx=a.spec_max_ctx
+            cache, a.max_ctx, log=log, spec=a.spec, spec_early=early, spec_ctx=a.spec_max_ctx, startup=st
         )
     engine = Engine(make, tok, special, log=log)
     tmpl = Path(a.ckpt, "chat_template.jinja")
@@ -448,7 +454,8 @@ def main(argv=None):
         max_tokens_default=a.max_tokens,
     )
     httpd = serve(app, a.host, a.port)
-    log(f"listening on http://{a.host}:{a.port}/ (UI: {a.ui_dir or 'none'}); loading the model")
+    url = f"http://{a.host}:{a.port}/"
+    log(f"listening on {url} (UI: {a.ui_dir or 'none'}); loading the model (/health answers 503 until it is ready)")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
     def on_signal(*_):  # Ctrl-C, kill, a job timeout: finish the step, release the traces, close the device
@@ -458,6 +465,7 @@ def main(argv=None):
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+    engine.on_ready = lambda: log(f"model ready: serving on {url}")
     try:
         engine.run()  # main thread: the device opens and closes here
     finally:
