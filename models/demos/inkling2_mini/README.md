@@ -32,7 +32,8 @@ Build tt-metal and activate its python env as usual. The scripts take their data
 |---|---|
 | `INKLING_CKPT` | the Hugging Face checkpoint directory (safetensors, config.json, tokenizer) |
 | `INKLING_MODE` | `default` or `fast`: which expert weights load (see "Run modes"; `--fast` in the demo and server) |
-| `INKLING_SPEC` | `1`: speculative decode in the demo and the server (`--spec`; see "Speculative decode") |
+| `INKLING_SPEC` | `0`: no speculative decode in the server (`--no-spec`; it is on by default, see "Speculative decode"); `1`: the demo's check (`--spec`) |
+| `INKLING_SPEC_MAX_CTX` | speculative decode below this position (default 143360; `--spec-max-ctx` in the server) |
 | `INKLING_CACHE` | the converted weight cache the model loads (overrides the mode's) |
 | `INKLING_TILE_CACHE` | a cache with the experts as tiles, for the chunked prefill and its test (overrides the mode's) |
 | `INKLING_PF_GATE_BF16` | `0`: prefill keeps the loop gate messages and outputs fp32 (default `1`: bf16, faster) |
@@ -61,7 +62,7 @@ The tokens are the same as plain decode; text the drafter predicts well comes ou
 
 | where | how |
 |---|---|
-| chat server | `--spec` or `INKLING_SPEC=1`: greedy and sampled requests |
+| chat server | on by default, greedy and sampled requests; `--no-spec` or `INKLING_SPEC=0` turn it off |
 | demo | `--spec` or `INKLING_SPEC=1`: each prompt also runs through spec decode; prints `spec_equals_plain`, tok/s |
 | code | `tt/spec_generator.py`: `SpecGenerator.generate_rows`, `generate_rows_from` |
 
@@ -99,9 +100,13 @@ At 128K context (greedy, before the stash steps and the sampled passes): continu
 - Drafting may cost a request at most 1.3 plain steps + 0.4 % over plain steps: beyond that the request runs
   plain steps and tries a draft again now and then.
 - A thinking budget turns spec off until the budget is used (the forced tokens must follow an exact token).
-- DRAM: the drafter context takes 12,288 B per token of `--max-ctx` beside the far KV's 19,584. 3-row passes fit up
-  to about 142K tokens in default mode (276K in fast mode), 2-row passes to about 151K (286K); the server picks
-  the rows at start and refuses `--spec` above that.
+- It never costs context. The server drafts below position 143,360 (`modes.SPEC_MAX_CTX`, `--spec-max-ctx`,
+  `INKLING_SPEC_MAX_CTX`) and runs plain steps from there on, at the plain server's speed and with the same
+  tokens; a reply that crosses the position goes on without a pause. The drafter keeps 4,608 B of DRAM per
+  position below it (two of its three layers read the last 1,032 positions only and keep rings), beside the far
+  KV's 19,584 B per token of `--max-ctx`. At `--max-ctx 196608` in default mode that leaves room for 3-row
+  passes; when DRAM is short for the drafter and a verify step the server says so at start and runs without
+  spec decode.
 
 A chunked prefill (`tt/prefill_model.py`; the server does not use it) gives the drafter no context for the prompt
 unless it is told to: set `Inkling2Prefill.drafter = <the DSparkDrafter>` before `prefill()` and every chunk also
@@ -161,7 +166,7 @@ model's reasoning comes as `reasoning_content`.
 
 ```
 python -m models.demos.inkling2_mini.server.fetch_ui       # once: Llama Chat (MIT), pinned and sha256-checked
-python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT --max-ctx 16384 [--fast] [--spec]
+python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT --max-ctx 16384 [--fast] [--no-spec]
 ```
 
 Then open http://127.0.0.1:8080/ once the log says the traces are captured (the UI waits while the model

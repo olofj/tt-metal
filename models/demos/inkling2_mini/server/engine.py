@@ -12,6 +12,9 @@ A runner does the device work, one token per step:
     read_logits()         fp32 host logits [vocab] of the last step run
     max_ctx
     spec                  True: the runner also has spec_pass (speculative decode)
+    spec_ctx              (optional) spec_pass only feeds positions below it; from there on spec_ready() is False
+                          and the steps are plain ones (the drafter's context is kept for that many positions, so
+                          that it never costs context: tt/spec_generator.py, modes.SPEC_MAX_CTX)
     spec_ready() -> bool  False while the runner wants plain steps (its drafts were not paying off lately)
     spec_pass(token, pos, max_rows, stop, sampler=None) -> list[int] | None
                           feed `token` at pos and up to max_rows - 1 drafted tokens the model agrees with, in one
@@ -91,9 +94,12 @@ class TTRunner:
     def SPEC_ACC(p):
         return 0.89 if p >= 0.9 else 0.95 * p * p
 
-    def __init__(self, cache, max_ctx, trace_mib=None, log=print, spec=False, spec_early="auto"):
+    def __init__(self, cache, max_ctx, trace_mib=None, log=print, spec=False, spec_early="auto", spec_ctx=None):
         """spec: speculative decode (tt/spec_generator.py): a drafter proposes SPEC_K tokens, one verify pass checks
-        them; same tokens as the plain step. spec_early: how many drafts a pass verifies.
+        them; same tokens as the plain step. spec_ctx: passes below this position only (None: modes.spec_max_ctx());
+        the steps from there on leave the drafter alone. When DRAM is short for the drafter and a verify step
+        beside the model at this max_ctx, spec is off (logged), never the context. spec_early: how many drafts a
+        pass verifies.
         "auto": by the cost model above; (t1, t2): draft 1 when its top probability is >= t1, draft 2 when the
         product of both is >= t2; None: always SPEC_K."""
         import ttnn
@@ -102,9 +108,25 @@ class TTRunner:
         from models.demos.inkling2_mini.tt.model import VOCAB_REAL, Inkling2Model
 
         self.ttnn, self.vocab, self.max_ctx = ttnn, VOCAB_REAL, max_ctx
+        from models.demos.inkling2_mini import modes
+
         if spec and max_ctx < self.SPEC_MIN_CTX:
-            raise ValueError(f"--spec needs --max-ctx >= {self.SPEC_MIN_CTX}")
+            log(f"speculative decode off: it needs --max-ctx >= {self.SPEC_MIN_CTX}")
+            spec = False
+        if spec:
+            from models.demos.inkling2_mini.tt.mtp import mtp_root
+
+            if not (mtp_root() / "manifest.json").is_file():
+                log(
+                    f"speculative decode off: no drafter weights in {mtp_root()} "
+                    "(python -m models.demos.inkling2_mini.convert.mtp writes them)"
+                )
+                spec = False
         self.spec, self.spec_early, self.drafter = spec, spec_early, None
+        self.spec_ctx = max_ctx
+        if spec:
+            # (not below the positions the verify traces are captured at)
+            self.spec_ctx = min(max_ctx, max(spec_ctx or modes.spec_max_ctx(), 2048))
         self._vrow = None  # (verify outputs, row) when the last device step was a verify pass
         self.spec_begin()
         # stash steps (TappedModel.stash): on = the group under way is stashed; pending = its positions so far
@@ -113,25 +135,39 @@ class TTRunner:
         # tuning: per pass (pos, draft probs, k, a, start time, sampled), per plain step (pos, None, -1, stash, time)
         self.spec_log = [] if os.environ.get("INKLING_SPEC_LOG") else None
         t0 = time.time()
-        # spec: the draft, verify (per row count, conv phase, far-chunk case) and commit traces need more room
-        self.dev = open_device(trace_region_size=(trace_mib or (1024 if spec else 512)) << 20)
+        # spec: the draft, verify (per row count, conv phase, far-chunk case), commit, stash and quiet traces take
+        # about 270 MiB of it (logged below), the plain server's 23
+        self.dev = open_device(trace_region_size=(trace_mib or 512) << 20)
         self.tail, self.tail_pieces = None, 0
         try:
+            m = None
             if spec:
+                from models.demos.inkling2_mini.tt.mtp import DSparkDrafter
                 from models.demos.inkling2_mini.tt.spec_generator import (
                     SpecGenerator,
-                    build,
+                    TappedModel,
                     dram_free_gib,
+                    spec_fits,
                     verify_rows,
                 )
                 from models.demos.inkling2_mini.tt.verify import VerifyStep
 
-                self.model, self.drafter = build(self.dev, max_ctx, log=lambda s: None, k=self.SPEC_K, root=cache)
-                m, d = self.model, self.drafter
+                m = TappedModel(self.dev, max_ctx=max_ctx, log=lambda s: None, root=cache)
+                free = dram_free_gib(self.dev)
+                if not spec_fits(free, self.spec_ctx):
+                    log(
+                        f"speculative decode off: {free:.2f} GiB DRAM free beside the model at --max-ctx {max_ctx}, "
+                        "too little for the drafter and a verify step"
+                    )
+                    self.spec = spec = m.tapping = False  # the plain model and server from here on
+                    self.spec_ctx = max_ctx
+            if spec:
+                d = self.drafter = m.drafter = DSparkDrafter(m, max_ctx=self.spec_ctx, k=self.SPEC_K)
                 d.head = d.make_head(ttnn.bfloat4_b)  # the drafts' own head copy (BFP4: 3.3 ms per draft pass)
                 d.top_probs = True
-            else:
-                self.model = m = Inkling2Model(self.dev, root=cache, max_ctx=max_ctx, log=lambda s: None)
+            if m is None:
+                m = Inkling2Model(self.dev, root=cache, max_ctx=max_ctx, log=lambda s: None)
+            self.model = m
             log(f"model loaded in {time.time() - t0:.0f} s")
             self.chain = self._alias_token(m)
             m.set_inputs(0, 0)
@@ -144,7 +180,7 @@ class TTRunner:
             if spec:
                 # the verify steps that fit in DRAM at this max_ctx (3-row passes need 0.28 GiB more)
                 free = dram_free_gib(self.dev)
-                rows = verify_rows(self.dev, max_ctx)
+                rows = verify_rows(self.dev, max_ctx)  # (spec_fits left room for the 2-row step)
                 stash = os.environ.get("INKLING_SPEC_STASH", "1") == "1"  # tuning: 0 = every step commits
                 self.gen = SpecGenerator(m, d, verify=[VerifyStep(m, r) for r in rows], stash=stash)
 
@@ -162,7 +198,7 @@ class TTRunner:
             else:
                 self.gen = Generator(m)
                 self.gen.capture()
-            outs = self.gen.out + (getattr(self.gen, "sout", None) or [])
+            outs = self.gen.out + (getattr(self.gen, "sout", None) or []) + (getattr(self.gen, "qout", None) or [])
             if tail and all(o["logits"].buffer_address() == lg.buffer_address() for o in outs):
                 self.tail = self._capture_tail(lg)
             if spec and self.tail is not None:
@@ -173,9 +209,10 @@ class TTRunner:
             )
             if spec:
                 log(
-                    f"speculative decode on (greedy{' and sampled' if self.spec_sampled else ''} requests): passes "
-                    f"of up to {max(rows)} rows, {free:.2f} GiB DRAM free before the verify steps, "
-                    f"{dram_free_gib(self.dev):.2f} now"
+                    f"speculative decode on (greedy{' and sampled' if self.spec_sampled else ''} requests) below "
+                    f"position {self.spec_ctx}{', plain steps from there on' if self.spec_ctx < max_ctx else ''}: "
+                    f"passes of up to {max(rows)} rows, {free:.2f} GiB DRAM free before the verify steps, "
+                    f"{dram_free_gib(self.dev):.2f} now, {self._trace_mib():.0f} MiB of traces"
                 )
         except BaseException:
             self.ttnn.close_device(self.dev)
@@ -184,6 +221,10 @@ class TTRunner:
         self.pos_ready = None  # position whose inputs are already written
         host = lambda: ttnn.from_torch(torch.zeros(1, 1, 1, 1, dtype=torch.int32), dtype=ttnn.uint32)  # noqa: E731
         self.slots = [[host(), None, -1] for _ in range(2)]  # [host token, event, pos]
+
+    def _trace_mib(self):
+        v = self.ttnn.get_memory_view(self.dev, self.ttnn.BufferType.TRACE)
+        return v.num_banks * v.total_bytes_allocated_per_bank / 2**20
 
     def _alias_token(self, m):
         """model.tokens = a [1, 1] view of the head's argmax buffer [1, 1, 1, 1] (both uint32 ROW_MAJOR DRAM)."""
@@ -285,6 +326,8 @@ class TTRunner:
         return self._bal + self.SPEC_DEBT[0] + self.SPEC_DEBT[1] * self._steps
 
     def spec_ready(self):
+        if self._next >= self.spec_ctx:  # the drafter does not cover the next position: plain steps
+            return False
         gate = os.environ.get("INKLING_SPEC_GATE")  # tuning: "0" never turns drafting off, "off" never drafts
         if gate in ("0", "off"):
             return gate == "0"
@@ -325,7 +368,10 @@ class TTRunner:
         m.phase = ph
         tr, outs = self.gen.trace, self.gen.out
         self._seq(pos)
-        if getattr(self.gen, "strace", None):
+        if self.spec and pos >= self.spec_ctx:  # past the drafter's positions: the step that leaves it alone
+            tr, outs = self.gen.qtrace, self.gen.qout
+            self._stash, self._pending = False, 0
+        elif getattr(self.gen, "strace", None):
             # a plain step that is not the fallback of a declined pass is one of a run (prompt feed, drafting off):
             # it stashes its drafter taps, from the next group start on (TappedModel.stash)
             run = self._declined != pos
@@ -367,7 +413,7 @@ class TTRunner:
 
     def _positions(self, pos):
         self.model.positions.update(pos)
-        if self.drafter is not None:  # the step also commits the drafter's context row of pos
+        if self.drafter is not None and pos < self.spec_ctx:  # the step also commits the drafter's context row
             self.drafter.set_commit_pos(pos)
 
     def spec_pass(self, token, pos, max_rows, stop=(), sampler=None):
@@ -379,7 +425,7 @@ class TTRunner:
         kmax = min(max(g.verifies) - 1, max_rows - 1, self.max_ctx - 1 - pos)
         if sampler is not None:
             kmax = min(kmax, len(self.vtail) - 1)
-        if kmax < 1 or pos < 1:
+        if kmax < 1 or pos < 1 or pos >= self.spec_ctx:
             self._declined = pos
             return None
         self._seq(pos, 0)
