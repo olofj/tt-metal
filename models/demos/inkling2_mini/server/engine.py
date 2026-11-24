@@ -11,13 +11,26 @@ A runner does the device work, one token per step:
     token_at(pos) -> int  argmax of the step at pos
     read_logits()         fp32 host logits [vocab] of the last step run
     max_ctx
-    spec                  True: the runner also has spec_pass (speculative decode, greedy requests only)
+    spec                  True: the runner also has spec_pass (speculative decode)
     spec_ready() -> bool  False while the runner wants plain steps (its drafts were not paying off lately)
-    spec_pass(token, pos, max_rows, stop) -> list[int] | None
+    spec_pass(token, pos, max_rows, stop, sampler=None) -> list[int] | None
                           feed `token` at pos and up to max_rows - 1 drafted tokens the model agrees with, in one
                           verify pass. Returns the model's tokens [t_0 .. t_a]: t_0 .. t_{a-1} are fed (positions
                           pos + 1 .. pos + a), t_a is the next token, not fed. Nothing is fed after a token of
-                          `stop`. None: nothing was fed (the drafter is not sure enough: feed() the token instead)
+                          `stop`. None: nothing was fed (the drafter is not sure enough: feed() the token instead).
+                          sampler: the request's Sampler (a sampled request). The model's token of row i is then
+                          sampler(logits of row i), drawn row by row in order, and draft i is kept only when the
+                          draw is that very token: the draws, and so the tokens, are those of plain steps with
+                          the same sampler (see "Sampled requests" below)
+
+Sampled requests under speculative decode. The drafter's proposal is one fixed token d per position (its argmax),
+i.e. a proposal distribution q with q(d) = 1. Speculative sampling accepts a proposal x ~ q with probability
+min(1, p(x) / q(x)) and otherwise draws from norm(max(0, p - q)), p being the sampler's distribution (after
+temperature, top-k, top-p, min-p). With q(d) = 1 that is: accept d with probability p(d), else draw from p with d
+removed. "Draw t ~ p; accept iff t == d; on a miss the token is t" is the same rule: P(t = d) = p(d), and given
+t != d, t is distributed as p without d. So the reply's distribution is the plain sampler's exactly, and since each
+row's logits are the plain step's logits bit for bit and the sampler makes one draw per token in the same order,
+a seeded request gives the very tokens of the plain path.
 `TTRunner` is the Inkling2 traced decode (tt/generator.py); the tests use a stub.
 
 Greedy decode runs one step ahead: the step on token t is queued before the host has read t, so the card goes from
@@ -59,15 +72,23 @@ class TTRunner:
     # next SPEC_OFF[0] tokens run as plain steps (doubling up to SPEC_OFF[1] while it stays so).
     PLAIN_MS = (15.6, 4.4e-5)
     SPEC_EXTRA_MS = (3.9, 11.3, 14.8)
-    SPEC_WINDOW, SPEC_OFF = 8, (16, 128)
+    # Drafting may not cost a request more than SPEC_DEBT_MS[0] + SPEC_DEBT_MS[1] x (its plain steps' time) over
+    # plain steps: each pass books (its tokens x a plain step) - (its cost) by the model above; while the sum is
+    # below minus that allowance the request runs plain steps (they raise the allowance, so drafting is tried
+    # again later, ever more rarely on text the drafter can not predict).
+    SPEC_DEBT_MS = (20.0, 0.004)
+    # SPEC_ACC is scaled per request by (accepted drafts + n0 s0) / (expected by SPEC_ACC + n0), over the drafts
+    # whose row was reached: text and sampler settings shift how often a draft is the model's token. SPEC_PRIOR
+    # (n0, s0 greedy, s0 sampled).
+    SPEC_PRIOR = (6.0, 1.0, 0.8)
 
     @staticmethod
     def SPEC_ACC(p):
         return 0.89 if p >= 0.9 else 0.95 * p * p
 
     def __init__(self, cache, max_ctx, trace_mib=None, log=print, spec=False, spec_early="auto"):
-        """spec: speculative decode for greedy requests (tt/spec_generator.py): a drafter proposes SPEC_K tokens, one
-        verify pass checks them; same tokens as the plain step. spec_early: how many drafts a pass verifies.
+        """spec: speculative decode (tt/spec_generator.py): a drafter proposes SPEC_K tokens, one verify pass checks
+        them; same tokens as the plain step. spec_early: how many drafts a pass verifies.
         "auto": by the cost model above; (t1, t2): draft 1 when its top probability is >= t1, draft 2 when the
         product of both is >= t2; None: always SPEC_K."""
         import ttnn
@@ -80,7 +101,8 @@ class TTRunner:
             raise ValueError(f"--spec needs --max-ctx >= {self.SPEC_MIN_CTX}")
         self.spec, self.spec_early, self.drafter = spec, spec_early, None
         self._vrow = None  # (verify outputs, row) when the last device step was a verify pass
-        self._hist, self._off, self._off_n = [], 0, self.SPEC_OFF[0]  # spec_ready()
+        self.spec_begin()
+        self.vtail = {}  # verify row -> (tail trace, row pieces): the row's logits as fp32 rows (sampled passes)
         self.spec_log = [] if os.environ.get("INKLING_SPEC_LOG") else None  # per pass: (pos, draft probs, k, a)
         t0 = time.time()
         # spec: the draft, verify (per row count, conv phase, far-chunk case) and commit traces need more room
@@ -116,20 +138,34 @@ class TTRunner:
                 free = dram_free_gib(self.dev)
                 rows = verify_rows(self.dev, max_ctx)
                 self.gen = SpecGenerator(m, d, verify=[VerifyStep(m, r) for r in rows])
-                self.gen.capture_rows(1536)
+
+                # the tails of the verify rows' logits are compiled before any capture, like every other program
+                def row_tails():
+                    for x in m.head_tail.rows_tiles[1 : max(rows)] if tail else []:
+                        for k in self.TAIL_PIECES:
+                            try:
+                                for t in self._rows(x, k):
+                                    ttnn.deallocate(t)
+                            except RuntimeError:  # circular buffers clash with L1 buffers (as in _capture_tail)
+                                pass
+
+                self.gen.capture_rows(1536, before_capture=row_tails)
             else:
                 self.gen = Generator(m)
                 self.gen.capture()
             if tail and all(o["logits"].buffer_address() == lg.buffer_address() for o in self.gen.out):
                 self.tail = self._capture_tail(lg)
+            if spec and self.tail is not None:
+                self._capture_vtails(lg, max(rows))
             log(
                 f"decode traces captured, {time.time() - t0:.0f} s (token chain {'on' if self.chain else 'off'}, "
                 f"logits row tail {f'{self.tail_pieces} pieces' if self.tail else 'off'})"
             )
             if spec:
                 log(
-                    f"speculative decode on (greedy requests): passes of up to {max(rows)} rows, "
-                    f"{free:.2f} GiB DRAM free before the verify steps, {dram_free_gib(self.dev):.2f} now"
+                    f"speculative decode on (greedy{' and sampled' if self.spec_sampled else ''} requests): passes "
+                    f"of up to {max(rows)} rows, {free:.2f} GiB DRAM free before the verify steps, "
+                    f"{dram_free_gib(self.dev):.2f} now"
                 )
         except BaseException:
             self.ttnn.close_device(self.dev)
@@ -188,29 +224,58 @@ class TTRunner:
             ttnn.release_trace(self.dev, tid)
         return None
 
+    def _capture_vtails(self, lg, n):
+        """self.vtail: the tail of each verify row's logits (row 0 is the plain step's buffer and tail). The rows
+        of a pass are the fused head's row buffers in every verify trace; else no sampled passes."""
+        ttnn, tiles = self.ttnn, self.model.head_tail.rows_tiles[:n]
+        same = lambda a, b: a.buffer_address() == b.buffer_address()  # noqa: E731
+        if len(tiles) < n or not same(tiles[0], lg):
+            return
+        if not all(same(x, t) for _, o in self.gen.vtrace.values() for x, t in zip(o["logits"], tiles)):
+            return
+        vt = {0: (self.tail, self.rows)}
+        for r in range(1, n):
+            tid = ttnn.begin_trace_capture(self.dev, cq_id=0)
+            rows = self._rows(tiles[r], self.tail_pieces)
+            ttnn.end_trace_capture(self.dev, tid, cq_id=0)
+            vt[r] = (tid, rows)
+            ttnn.execute_trace(self.dev, tid, cq_id=0, blocking=False)
+            want = ttnn.to_torch(tiles[r]).float().reshape(-1)
+            got = torch.cat([ttnn.to_torch(t).float().reshape(-1) for t in rows])
+            if not torch.equal(want.view(torch.int32), got.view(torch.int32)):
+                for t, _ in list(vt.values())[1:]:
+                    ttnn.release_trace(self.dev, t)
+                return
+        self.vtail = vt
+
+    @property
+    def spec_sampled(self):
+        """Sampled requests run verify passes too (else the plain step)."""
+        return len(self.vtail) > 1
+
     def reset(self):
         self.model.reset()
 
-    def spec_begin(self):
-        """A new request: drafting is on again."""
-        self._hist, self._off, self._off_n = [], 0, self.SPEC_OFF[0]
+    def spec_begin(self, sampled=False):
+        """A new request: its drafting account and its accept scale start over."""
+        self._bal = self._plain_ms = 0.0
+        self._hit, self._exp = self.SPEC_PRIOR[0] * self.SPEC_PRIOR[2 if sampled else 1], self.SPEC_PRIOR[0]
 
     def spec_ready(self):
-        return self._off <= 0
-
-    def _spec_note(self, k, tokens, pos):
-        """One pass done: k drafts verified, `tokens` tokens gained. Turns drafting off for a while when it loses."""
         if os.environ.get("INKLING_SPEC_GATE") == "0":  # tuning: never turn drafting off
-            return
+            return True
+        return self._bal >= -(self.SPEC_DEBT_MS[0] + self.SPEC_DEBT_MS[1] * self._plain_ms)
+
+    def _acc(self, p):
+        return min(0.97, self.SPEC_ACC(p) * self._hit / self._exp)
+
+    def _spec_note(self, k, a, pr, pos):
+        """One pass done: k drafts verified, the first a of them kept (draft a, if any, was not the model's)."""
         plain = self.PLAIN_MS[0] + self.PLAIN_MS[1] * pos
-        self._hist = (self._hist + [(plain + self.SPEC_EXTRA_MS[k], tokens * plain)])[-self.SPEC_WINDOW :]
-        if len(self._hist) < self.SPEC_WINDOW:
-            return
-        if sum(c for c, _ in self._hist) > sum(t for _, t in self._hist):
-            self._off, self._hist = self._off_n, []
-            self._off_n = min(2 * self._off_n, self.SPEC_OFF[1])
-        else:
-            self._off_n = self.SPEC_OFF[0]
+        self._bal += (a + 1) * plain - (plain + self.SPEC_EXTRA_MS[k])
+        for i in range(min(k, a + 1)):
+            self._exp += self.SPEC_ACC(pr[i])
+            self._hit += i < a
 
     def _run(self, pos, token, read):
         """Inputs (token: None = the head's argmax already in place), replay, argmax read; then the next position's
@@ -226,7 +291,7 @@ class TTRunner:
             self._positions(pos)
         ttnn.execute_trace(self.dev, self.gen.trace[ph], cq_id=0, blocking=False)
         self.out, self._vrow = self.gen.out[ph], None
-        self._off -= 1
+        self._plain_ms += self.PLAIN_MS[0] + self.PLAIN_MS[1] * pos
         if read:
             s = self.slots[pos % 2]
             if s[1] is not None:
@@ -242,11 +307,14 @@ class TTRunner:
         if self.drafter is not None:  # the step also commits the drafter's context row of pos
             self.drafter.set_commit_pos(pos)
 
-    def spec_pass(self, token, pos, max_rows, stop=()):
+    def spec_pass(self, token, pos, max_rows, stop=(), sampler=None):
         """See the module docstring. One draft pass, the drafts' probabilities read, then (if a draft is kept) one
-        verify pass over token + drafts, the tokens read, and the commit of the accepted rows."""
+        verify pass over token + drafts, the model's tokens (read, or sampled row by row), and the commit of the
+        accepted rows."""
         ttnn, g, d = self.ttnn, self.gen, self.drafter
         kmax = min(max(g.verifies) - 1, max_rows - 1, self.max_ctx - 1 - pos)
+        if sampler is not None:
+            kmax = min(kmax, len(self.vtail) - 1)
         if kmax < 1 or pos < 1:
             return None
         if self.slots[(pos - 1) % 2][1] is not None:  # a queued token read of the step before: done before new work
@@ -263,8 +331,8 @@ class TTRunner:
         pr = ttnn.to_torch(d.probs).float()[0, 0, 0, :kmax].tolist()
         if self.spec_early == "auto":
             plain = self.PLAIN_MS[0] + self.PLAIN_MS[1] * pos
-            a1 = self.SPEC_ACC(pr[0])
-            exp = [1.0, 1.0 + a1] + ([1.0 + a1 + a1 * self.SPEC_ACC(pr[1])] if kmax > 1 else [])
+            a1 = self._acc(pr[0])
+            exp = [1.0, 1.0 + a1] + ([1.0 + a1 + a1 * self._acc(pr[1])] if kmax > 1 else [])
             k = max(range(len(exp)), key=lambda i: exp[i] / (plain + self.SPEC_EXTRA_MS[i]))
         elif self.spec_early is not None:
             t1, t2 = self.spec_early
@@ -273,24 +341,43 @@ class TTRunner:
         if k == 0:
             if self.spec_log is not None:
                 self.spec_log.append((pos, pr, 0, 0))
-            self._spec_note(0, 1, pos)
+            self._spec_note(0, 0, pr, pos)
             return None
         rows, ph = k + 1, pos % 4
         tid, out = g.vtrace[(rows, ph, g._shared(pos, rows))]
         ttnn.execute_trace(self.dev, tid, cq_id=0, blocking=False)
-        tgt = [int(x) for x in ttnn.to_torch(g.vtok[rows]).reshape(-1)[:rows].tolist()]
-        drafts = [int(x) for x in ttnn.to_torch(d.tokens).reshape(-1)[:k].tolist()]
-        a = 0
-        while a < k and drafts[a] == tgt[a]:
-            a += 1
-            if tgt[a - 1] in stop:  # the reply ends there: nothing after it is fed
-                break
+        if sampler is None:
+            tgt = [int(x) for x in ttnn.to_torch(g.vtok[rows]).reshape(-1)[:rows].tolist()]
+            drafts = [int(x) for x in ttnn.to_torch(d.tokens).reshape(-1)[:k].tolist()]
+            a = 0
+            while a < k and drafts[a] == tgt[a]:
+                a += 1
+                if tgt[a - 1] in stop:  # the reply ends there: nothing after it is fed
+                    break
+            tgt = tgt[: a + 1]
+        else:
+            # row r's token = one sampler draw on row r's logits, rows in order, while the draws equal the drafts
+            # (the draws of plain steps on the same tokens). The rows' tails run one row ahead of the host's draws.
+            for r in range(min(2, rows)):
+                ttnn.execute_trace(self.dev, self.vtail[r][0], cq_id=0, blocking=False)
+            drafts = [int(x) for x in ttnn.to_torch(d.tokens).reshape(-1)[:k].tolist()]
+            tgt, a = [], 0
+            while True:
+                tgt.append(sampler(self._vrow_logits(a)))
+                if a == k or tgt[a] != drafts[a] or (a > 0 and tgt[a - 1] in stop):
+                    break
+                a += 1
+                if a + 1 < rows:
+                    ttnn.execute_trace(self.dev, self.vtail[a + 1][0], cq_id=0, blocking=False)
         ttnn.execute_trace(self.dev, g.ctrace[(rows, ph, a + 1)], cq_id=0, blocking=False)
         self.out, self._vrow = None, (out, a)
-        self._spec_note(k, a + 1, pos)
+        self._spec_note(k, a, pr, pos)
         if self.spec_log is not None:
             self.spec_log.append((pos, pr, k, a))
-        return tgt[: a + 1]
+        return tgt
+
+    def _vrow_logits(self, r):
+        return torch.cat([self.ttnn.to_torch(t).float().reshape(-1) for t in self.vtail[r][1]])[: self.vocab]
 
     def feed(self, token, pos, read=True):
         self._run(pos, token, read)
@@ -307,9 +394,12 @@ class TTRunner:
         return int(self.ttnn.to_torch(s[0]).reshape(-1)[0])
 
     def read_logits(self):
-        if self._vrow is not None:  # after a verify pass: the row of the last fed token (one TILE read, 25 MB)
+        if self._vrow is not None:  # after a verify pass: the row of the last fed token
             out, row = self._vrow
-            return self.ttnn.to_torch(out["logits"][row]).float().reshape(-1)[: self.vocab]
+            if row in self.vtail:
+                self.ttnn.execute_trace(self.dev, self.vtail[row][0], cq_id=0, blocking=False)
+                return self._vrow_logits(row)
+            return self.ttnn.to_torch(out["logits"][row]).float().reshape(-1)[: self.vocab]  # one TILE read, 25 MB
         if self.tail is None:
             return self.ttnn.to_torch(self.out["logits"]).float().reshape(-1)[: self.vocab]
         self.ttnn.execute_trace(self.dev, self.tail, cq_id=0, blocking=False)
@@ -321,8 +411,8 @@ class TTRunner:
 
             with open(os.environ["INKLING_SPEC_LOG"], "w") as f:
                 json.dump(self.spec_log, f)
-        if self.tail is not None:
-            self.ttnn.release_trace(self.dev, self.tail)
+        for tid in {t for t, _ in self.vtail.values()} | ({self.tail} if self.tail is not None else set()):
+            self.ttnn.release_trace(self.dev, tid)
         self.gen.release()
         self.ttnn.close_device(self.dev)
 
@@ -436,8 +526,11 @@ class Engine:
             job.events.put(("error", f"prompt is {len(prompt)} tokens, the context is {r.max_ctx}"))
             return
         t0 = time.perf_counter()
-        if getattr(r, "spec", False):
-            r.spec_begin()
+        greedy = job.sampler.greedy
+        # speculative decode: greedy requests, and sampled ones when the runner can sample a pass's rows
+        spec = getattr(r, "spec", False) and (greedy or getattr(r, "spec_sampled", False))
+        if spec:
+            r.spec_begin(sampled=not greedy)
         n = len(self.fed)
         reuse = n > 0 and prompt[:n] == self.fed and (n < len(prompt) or self.last_logits is not None)
         if not reuse:
@@ -455,16 +548,16 @@ class Engine:
         new = []
         finish = "length"
         t1 = None
-        greedy = job.sampler.greedy
         ahead = False  # a step on the argmax of the step at len(fed) - 1 is queued at len(fed) (greedy)
-        # speculative decode (runner.spec, greedy): a pass feeds a token and the drafts the model agrees with, and
-        # returns the model's tokens; `known` holds those not yet handled below: (token, already fed)
+        # speculative decode: a pass feeds a token and the drafts the model agrees with, and returns the model's
+        # tokens (sampled request: the sampler's draws); `known` holds those not yet handled below: (token, already
+        # fed)
         known = []
         n_pass = n_pass_tok = 0
 
         def spec_ok():
             # not while a thinking budget may force tokens: the tokens of a pass are fed before they are handled
-            ok = greedy and getattr(r, "spec", False) and not forced and job.thinking_budget < 0
+            ok = spec and not forced and job.thinking_budget < 0
             return ok and r.spec_ready()
 
         def look_ahead():  # greedy: queue the next step on the card's own argmax before the host has read it
@@ -502,7 +595,11 @@ class Engine:
             # the step on t goes to the card before the text work below; once queued, t counts as fed
             queued, ahead = ahead, False
             if not queued and not was_fed and len(new) < limit:
-                tg = r.spec_pass(t, len(self.fed), limit - len(new) + 1, self.sp.stop) if spec_ok() else None
+                tg = None
+                if spec_ok():
+                    tg = r.spec_pass(
+                        t, len(self.fed), limit - len(new) + 1, self.sp.stop, None if greedy else job.sampler
+                    )
                 if tg is not None:  # t and tg[:-1] are fed now; tg[-1] is the token after them
                     self.fed += [t] + tg[:-1]
                     self.last_logits = None

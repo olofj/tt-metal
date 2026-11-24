@@ -47,13 +47,13 @@ class EchoRunner:
         assert pos == len(self.seq) - 1 or pos == len(self.seq) - 2, (pos, len(self.seq))
         return self.out[pos]
 
-    def spec_begin(self):
+    def spec_begin(self, sampled=False):
         pass
 
     def spec_ready(self):
         return self.n_step % 7 != 6  # now and then: a plain step
 
-    def spec_pass(self, token, pos, max_rows, stop=()):
+    def spec_pass(self, token, pos, max_rows, stop=(), sampler=None):
         assert pos == len(self.seq), (pos, len(self.seq))
         self.n_pass += 1
         self.n_step += 1

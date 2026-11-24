@@ -274,3 +274,100 @@ def test_spec_engine(tok):
     # the second turn reuses the first reply in both: no reset; the stop token is fed by the plain path's step
     # ahead, and by a pass only when the drafter drafted it
     assert spec[1][5] in (plain[1][5] - 1, plain[1][5]) and spec[1][6] == spec[0][6]
+
+
+class _RandomRunner:
+    """A random "model" for the engine: the logits after a token sequence are a fixed function of its last two
+    tokens (64 live tokens, one of them a stop token). spec_pass as engine.TTRunner.spec_pass: the drafts are the
+    argmax tokens, every 4th one wrong."""
+
+    def __init__(self, vocab, stop, max_ctx=512, spec=False):
+        self.vocab, self.max_ctx, self.spec, self.spec_sampled = vocab, max_ctx, spec, spec
+        self.live = torch.tensor(list(range(100, 163)) + [stop])
+        self.seq, self.n_draft, self.passes, self.kept = [], 0, 0, 0
+
+    def reset(self):
+        self.seq = []
+
+    def _logits(self, seq):
+        g = torch.Generator().manual_seed(1 + seq[-1] * 1009 + (seq[-2] if len(seq) > 1 else 0))
+        lg = torch.full((self.vocab,), -30.0)
+        lg[self.live] = torch.randn(64, generator=g) * 2.5
+        return lg
+
+    def feed(self, token, pos, read=True):
+        assert pos == len(self.seq)
+        self.seq.append(token)
+
+    def feed_next(self, pos):
+        self.feed(self.token_at(pos - 1), pos)
+
+    def token_at(self, pos):
+        return int(self._logits(self.seq[: pos + 1]).argmax())
+
+    def read_logits(self):
+        return self._logits(self.seq)
+
+    def spec_begin(self, sampled=False):
+        pass
+
+    def spec_ready(self):
+        return True
+
+    def spec_pass(self, token, pos, max_rows, stop=(), sampler=None):
+        assert pos == len(self.seq)
+        k = min(2, max_rows - 1)
+        if k < 1 or pos % 5 == 4:
+            return None
+        seq, drafts = self.seq + [token], []
+        for _ in range(k):  # the drafter: the model's argmax, every 4th draft another token
+            self.n_draft += 1
+            d = int(self._logits(seq + drafts).argmax())
+            drafts.append(d if self.n_draft % 4 else int(self.live[self.n_draft % 63]))
+        tgt, a = [], 0
+        while True:
+            lg = self._logits(seq + drafts[:a])
+            tgt.append(int(lg.argmax()) if sampler is None else sampler(lg))
+            if a == k or tgt[a] != drafts[a] or (a > 0 and tgt[a - 1] in stop):
+                break
+            a += 1
+        self.seq = seq + drafts[:a]
+        self.passes, self.kept = self.passes + 1, self.kept + a
+        return tgt
+
+
+def test_spec_sampled_engine(tok):
+    """Sampled requests through speculative passes: for every seed the very tokens of the plain path (each row's
+    token is the sampler's draw on that row's logits, in order), so the same distribution; drafts are both kept and
+    dropped on the way."""
+    from models.demos.inkling2_mini.server.chat import Sampler, SpecialIds
+    from models.demos.inkling2_mini.server.engine import Engine, Job
+
+    sp = SpecialIds(tok)
+    stop = sorted(sp.stop)[0]
+
+    def run(spec, raw):
+        runner = _RandomRunner(len(tok), stop, spec=spec)
+        engine = Engine(lambda: runner, tok, sp, log=lambda s: None).start()
+        engine.ready.wait(10)
+        out = []
+        try:
+            for seed in range(24):
+                for kw in ({}, {"top_k": 40, "top_p": 0.95, "min_p": 0.05}, {"temperature": 0.0}):
+                    job = engine.submit(
+                        Job([5, 6, 7 + seed], 40, Sampler(**{"temperature": 0.8, "seed": seed, **kw}), raw=raw)
+                    )
+                    while (ev := job.events.get(timeout=10))[0] != "done":
+                        assert ev[0] != "error", ev
+                    out.append(
+                        (ev[1]["content"], ev[1]["reasoning"], ev[1]["completion_tokens"], ev[1]["finish_reason"])
+                    )
+        finally:
+            engine.stop()
+        return out, runner
+
+    for raw in (False, True):
+        (plain, _), (spec, r) = run(False, raw), run(True, raw)
+        assert plain == spec
+        assert r.passes > 100 and 0.2 < r.kept / (2 * r.passes) < 0.9, (r.passes, r.kept)
+    assert len({p[0] for p in plain}) > 40 and any(p[3] == "stop" for p in run(False, False)[0])

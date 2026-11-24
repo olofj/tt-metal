@@ -392,9 +392,10 @@ def main(argv=None):
         "--spec",
         action="store_true",
         default=os.environ.get("INKLING_SPEC") == "1",
-        help="speculative decode for greedy requests (also INKLING_SPEC=1): a small drafter proposes 2 tokens, one "
-        "verify pass checks them; the same tokens as without it, more tokens per second on text the drafter "
-        "predicts. Sampled requests run the plain step. Needs --max-ctx >= 4096 and the drafter weights "
+        help="speculative decode (also INKLING_SPEC=1): a small drafter proposes 2 tokens, one verify pass checks "
+        "them; the same tokens as without it, more tokens per second on text the drafter predicts. Sampled "
+        "requests too: a draft is kept when the sampler draws it, so a seeded reply is the same as without "
+        "--spec. Needs --max-ctx >= 4096 and the drafter weights "
         "(convert.mtp); off by default",
     )
     a = ap.parse_args(argv)
