@@ -64,20 +64,27 @@ class TTRunner:
     SPEC_K = 2  # drafts per pass: verify passes of 2 and 3 rows
     SPEC_MIN_CTX = 4096  # the verify traces are captured around position 1536
 
-    # Cost model of a pass, in plain steps of this process (p100a at 4K, default and fast mode within 0.03; the
-    # 128K passes of S8 / S9 give the same ratios): a draft alone costs SPEC_COST[0], a pass with k verified drafts
-    # 1 + SPEC_COST[k]. A draft with top probability p is right about SPEC_ACC(p) of the time (the drafter is
-    # overconfident), scaled per request by (accepted drafts + n0 s0) / (expected by SPEC_ACC + n0) over the drafts
-    # whose row was reached: SPEC_PRIOR = (n0, s0 greedy, s0 sampled). The row count of a pass is the one with the
-    # most expected tokens per step; the draft is paid by then, so no draft is verified unless that beats one
-    # plain step.
-    # Drafting may not cost a request more than SPEC_DEBT[0] + SPEC_DEBT[1] x (its plain steps) over plain steps:
-    # each pass books (its tokens) - (its cost); while the sum is below minus that allowance the request runs plain
-    # steps (they raise the allowance, so drafting is tried again later, ever more rarely on text the drafter can
-    # not predict).
+    # Cost model of a pass, in plain steps of this process: at 4K a draft alone costs SPEC_COST[0], a pass with k
+    # verified drafts 1 + SPEC_COST[k] (p100a, default and fast mode within 0.03). A plain step grows with the
+    # position (far attention; x 1.38 at 128K) and a pass's extra time hardly does (x 1.1: its rows share the far
+    # read), so the costs shrink with it: SPEC_FAR = those two slopes per 131072 positions (at 128K: 0.28, 0.60,
+    # 0.84, measured 0.30, 0.59, 0.83).
+    # A draft with top probability p is right about SPEC_ACC(p) of the time (the drafter is overconfident), scaled
+    # per request by (accepted drafts + n0 s0) / (expected by SPEC_ACC + n0) over the drafts whose row was
+    # reached: SPEC_PRIOR = (n0, s0 greedy, s0 sampled). The row count of a pass is the one with the most
+    # expected tokens per step; the draft is paid by then, so no draft is verified unless that beats one plain
+    # step.
+    # Each draft books (tokens gained) - (its cost). Drafting may not cost a request more than SPEC_DEBT[0] +
+    # SPEC_DEBT[1] x (its plain steps) over plain steps (not counted before SPEC_DEBT[2] drafts: one failed pass
+    # says little): below that the request runs plain steps. It then tries one draft every SPEC_PROBE[0] steps,
+    # doubling to SPEC_PROBE[1] while the probes do not gain. A probe that gains gives drafting SPEC_PROBE[2]
+    # steps of new credit; once that run has gained a step the probe gap starts over. So text the drafter can not
+    # predict costs a few drafts, ever more rarely, and a stretch it can predict is found within the probe gap.
     SPEC_COST = (0.35, 0.75, 1.05)
-    SPEC_DEBT = (0.7, 0.002)
+    SPEC_FAR = (0.1, 0.38)
     SPEC_PRIOR = (6.0, 1.0, 0.95)
+    SPEC_DEBT = (0.7, 0.002, 4)
+    SPEC_PROBE = (8, 128, 0.7)
 
     @staticmethod
     def SPEC_ACC(p):
@@ -268,21 +275,42 @@ class TTRunner:
 
     def spec_begin(self, sampled=False):
         """A new request: its drafting account and its accept scale start over."""
-        self._bal, self._steps = 0.0, 0
+        self._bal, self._steps, self._n, self._mark = 0.0, 0, 0, None
+        self._gap, self._wait = self.SPEC_PROBE[0], 0
         self._hit, self._exp = self.SPEC_PRIOR[0] * self.SPEC_PRIOR[2 if sampled else 1], self.SPEC_PRIOR[0]
+
+    def _room(self):
+        """Steps the account may still lose before drafting stops."""
+        return self._bal + self.SPEC_DEBT[0] + self.SPEC_DEBT[1] * self._steps
 
     def spec_ready(self):
         gate = os.environ.get("INKLING_SPEC_GATE")  # tuning: "0" never turns drafting off, "off" never drafts
         if gate in ("0", "off"):
             return gate == "0"
-        return self._bal >= -(self.SPEC_DEBT[0] + self.SPEC_DEBT[1] * self._steps)
+        return self._room() >= 0 or self._n < self.SPEC_DEBT[2] or self._wait <= 0
 
     def _acc(self, p):
         return min(0.97, self.SPEC_ACC(p) * self._hit / self._exp)
 
-    def _spec_note(self, k, a, pr):
-        """One pass done: k drafts verified, the first a of them kept (draft a, if any, was not the model's)."""
-        self._bal += a - self.SPEC_COST[k]
+    def _cost(self, pos):
+        x = pos / 131072
+        return [c * (1 + self.SPEC_FAR[0] * x) / (1 + self.SPEC_FAR[1] * x) for c in self.SPEC_COST]
+
+    def _spec_note(self, k, a, pr, pos):
+        """One draft at pos done: k of its tokens verified (0: declined), the first a of them kept (draft a, if
+        any, was not the model's)."""
+        v = a - self._cost(pos)[k]
+        probe = self._room() < 0 and self._n >= self.SPEC_DEBT[2]
+        self._bal, self._n = self._bal + v, self._n + 1
+        if probe and v > 0:  # new credit; _mark: the account at which this run has gained a step
+            self._bal = max(self._bal, self._bal - self._room() + self.SPEC_PROBE[2])
+            self._mark = self._bal + 1.0
+        elif self._mark is not None and self._bal >= self._mark:
+            self._gap, self._mark = self.SPEC_PROBE[0], None
+        if self._room() < 0 and self._n >= self.SPEC_DEBT[2]:  # stopped (again): the next probe after the gap
+            if probe or self._mark is not None:
+                self._gap = min(2 * self._gap, self.SPEC_PROBE[1])
+            self._wait, self._mark = self._gap, None
         for i in range(min(k, a + 1)):
             self._exp += self.SPEC_ACC(pr[i])
             self._hit += i < a
@@ -319,7 +347,7 @@ class TTRunner:
             self.spec_log.append((pos, None, -1, int(self._stash), time.perf_counter()))
         ttnn.execute_trace(self.dev, tr[ph], cq_id=0, blocking=False)
         self.out, self._vrow = outs[ph], None
-        self._steps += 1
+        self._steps, self._wait = self._steps + 1, self._wait - 1
         if read:
             s = self.slots[pos % 2]
             if s[1] is not None:
@@ -370,7 +398,8 @@ class TTRunner:
         if self.spec_early == "auto":
             a1 = self._acc(pr[0])
             exp = [1.0, 1.0 + a1] + ([1.0 + a1 + a1 * self._acc(pr[1])] if kmax > 1 else [])
-            k = max(range(len(exp)), key=lambda i: exp[i] / (1.0 + self.SPEC_COST[i] if i else 1.0))
+            cost = self._cost(pos)
+            k = max(range(len(exp)), key=lambda i: exp[i] / (1.0 + cost[i] if i else 1.0))
         elif self.spec_early is not None:
             t1, t2 = self.spec_early
             k = 0 if pr[0] < t1 else 1 if kmax < 2 or pr[0] * pr[1] < t2 else 2
@@ -378,7 +407,7 @@ class TTRunner:
         if k == 0:
             if self.spec_log is not None:
                 self.spec_log.append((pos, pr, 0, 0, t0, sampler is not None))
-            self._spec_note(0, 0, pr)
+            self._spec_note(0, 0, pr, pos)
             self._declined = pos
             return None
         rows, ph = k + 1, pos % 4
@@ -410,7 +439,7 @@ class TTRunner:
         ttnn.execute_trace(self.dev, g.ctrace[(rows, ph, a + 1)], cq_id=0, blocking=False)
         self.out, self._vrow = None, (out, a)
         self._next = pos + a + 1
-        self._spec_note(k, a, pr)
+        self._spec_note(k, a, pr, pos)
         if self.spec_log is not None:
             self.spec_log.append((pos, pr, k, a, t0, sampler is not None))
         return tgt
