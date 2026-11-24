@@ -3,7 +3,7 @@
 """Chat server for Inkling-2-Mini on one p100a: the OpenAI chat API plus the llama-server endpoints its web UI
 (Llama Chat) reads, so that UI, Open WebUI or any OpenAI client can talk to the model.
 
-    python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT [--cache DIR] [--port 8080]
+    python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT [--fast | --cache DIR] [--port 8080]
 
 Endpoints: POST /v1/chat/completions (stream or not; SSE), GET /v1/models, /models, /props, /health, /slots;
 POST /v1/chat/completions/control (UI "stop reasoning"), /v1/streams/lookup (no resumable streams: []).
@@ -28,6 +28,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from models.demos.inkling2_mini import modes
 from models.demos.inkling2_mini.server.chat import EFFORT_LEVELS, Sampler, SpecialIds, prompt_ids, template_kwargs
 from models.demos.inkling2_mini.server.engine import Engine, Job
 
@@ -380,9 +381,13 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1: this machine only)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--ckpt", default=os.environ.get("INKLING_CKPT"), help="checkpoint dir (tokenizer, template)")
-    # default as convert/cache.py DEFAULT_ROOT (not imported here: it pulls in ttnn, and --fake runs without it)
-    cache = os.environ.get("INKLING_CACHE") or "/work/inkling-bringup/cache/own2-def-pf"
-    ap.add_argument("--cache", default=cache, help="converted weight cache ($INKLING_CACHE, else own2-def-pf)")
+    ap.add_argument("--cache", default=None, help="converted weight cache (default: the run mode's, see --fast)")
+    ap.add_argument(
+        "--fast",
+        action="store_true",
+        help="fast mode (also INKLING_MODE=fast): own3-l8 experts, ~1.5 ms/token faster decode, KL .0096 vs .0067 "
+        "(default mode: own3-def8). $INKLING_CACHE or --cache override either",
+    )
     ap.add_argument("--max-ctx", type=int, default=16384, help="context size (decode cost grows with it)")
     ap.add_argument("--max-tokens", type=int, default=-1, help="default reply limit (-1: up to the context)")
     ap.add_argument("--ui-dir", default=None, help="Llama Chat static files (fetch_ui.py prints the path)")
@@ -391,6 +396,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.ckpt is None:
         ap.error("--ckpt or INKLING_CKPT is required (the tokenizer and chat template)")
+    if a.cache is None:
+        a.cache = str(modes.roots(a.fast)[0])
     if a.ui_dir is None:
         from models.demos.inkling2_mini.server.fetch_ui import default_dir
 

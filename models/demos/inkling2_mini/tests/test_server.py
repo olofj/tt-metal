@@ -223,6 +223,23 @@ def test_pf_cache(tmp_path):
     assert pf_cache(tile, log=lambda s: None) == pf2
 
 
+def test_modes(monkeypatch, expect_error):
+    from models.demos.inkling2_mini import modes
+
+    d = modes.CACHE_DIR
+    for v in ("INKLING_MODE", "INKLING_CACHE", "INKLING_TILE_CACHE"):
+        monkeypatch.delenv(v, raising=False)
+    assert modes.roots() == (d / "own3-def8-pf", d / "own3-def8-tile")
+    assert modes.roots(fast=True) == (d / "own3-l8-pf", d / "own3-l8-tile")
+    monkeypatch.setenv("INKLING_MODE", "fast")
+    assert modes.roots() == modes.roots(fast=True)
+    monkeypatch.setenv("INKLING_CACHE", "/x")  # an explicit cache wins over the mode
+    assert modes.roots()[0].as_posix() == "/x" and modes.roots()[1] == d / "own3-l8-tile"
+    monkeypatch.setenv("INKLING_MODE", "slow")
+    with expect_error(ValueError, "INKLING_MODE"):
+        modes.roots()
+
+
 def test_greedy_thinking_budget_and_limits(srv):
     """The one-step-ahead path with forced tokens, a token limit and a stop string."""
     base, _, _ = srv
