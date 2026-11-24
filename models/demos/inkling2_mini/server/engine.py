@@ -100,7 +100,7 @@ class TTRunner:
         self._vrow = None  # (verify outputs, row) when the last device step was a verify pass
         self.spec_begin()
         # stash steps (TappedModel.stash): on = the group under way is stashed; pending = its positions so far
-        self._stash, self._pending, self._declined = False, 0, None
+        self._stash, self._pending, self._declined, self._next = False, 0, None, 0
         self.vtail = {}  # verify row -> (tail trace, row pieces): the row's logits as fp32 rows (sampled passes)
         # tuning: per pass (pos, draft probs, k, a, start time, sampled), per plain step (pos, None, -1, stash, time)
         self.spec_log = [] if os.environ.get("INKLING_SPEC_LOG") else None
@@ -257,7 +257,14 @@ class TTRunner:
 
     def reset(self):
         self.model.reset()
-        self._stash, self._pending = False, 0
+        self._stash, self._pending, self._next = False, 0, 0
+
+    def _seq(self, pos, n=1):
+        """The step or pass at pos feeds n positions. A position that does not follow the last one (the state was
+        set from outside) drops the stash group under way: its slots belong to the other sequence."""
+        if pos != self._next:
+            self._stash, self._pending = False, 0
+        self._next = pos + n
 
     def spec_begin(self, sampled=False):
         """A new request: its drafting account and its accept scale start over."""
@@ -288,6 +295,7 @@ class TTRunner:
         ttnn, m, ph = self.ttnn, self.model, pos % FusedShortConv.PHASES
         m.phase = ph
         tr, outs = self.gen.trace, self.gen.out
+        self._seq(pos)
         if getattr(self.gen, "strace", None):
             # a plain step that is not the fallback of a declined pass is one of a run (prompt feed, drafting off):
             # it stashes its drafter taps, from the next group start on (TappedModel.stash)
@@ -345,6 +353,7 @@ class TTRunner:
         if kmax < 1 or pos < 1:
             self._declined = pos
             return None
+        self._seq(pos, 0)
         self._flush()
         if self.slots[(pos - 1) % 2][1] is not None:  # a queued token read of the step before: done before new work
             ttnn.event_synchronize(self.slots[(pos - 1) % 2][1])
@@ -400,6 +409,7 @@ class TTRunner:
                     ttnn.execute_trace(self.dev, self.vtail[a + 1][0], cq_id=0, blocking=False)
         ttnn.execute_trace(self.dev, g.ctrace[(rows, ph, a + 1)], cq_id=0, blocking=False)
         self.out, self._vrow = None, (out, a)
+        self._next = pos + a + 1
         self._spec_note(k, a, pr)
         if self.spec_log is not None:
             self.spec_log.append((pos, pr, k, a, t0, sampler is not None))
