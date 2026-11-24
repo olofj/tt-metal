@@ -32,6 +32,7 @@ Build tt-metal and activate its python env as usual. The scripts take their data
 |---|---|
 | `INKLING_CKPT` | the Hugging Face checkpoint directory (safetensors, config.json, tokenizer) |
 | `INKLING_MODE` | `default` or `fast`: which expert weights load (see "Run modes"; `--fast` in the demo and server) |
+| `INKLING_SPEC` | `1`: speculative decode in the demo and the server (`--spec`; see "Speculative decode") |
 | `INKLING_CACHE` | the converted weight cache the model loads (overrides the mode's) |
 | `INKLING_TILE_CACHE` | a cache with the experts as tiles, for the chunked prefill and its test (overrides the mode's) |
 | `INKLING_PF_GATE_BF16` | `0`: prefill keeps the loop gate messages and outputs fp32 (default `1`: bf16, faster) |
@@ -55,34 +56,45 @@ defaults in both modes, with the loop gate messages stored bf16 (`INKLING_PF_GAT
 
 ## Speculative decode (off by default)
 
-`tt/spec_generator.py` (`SpecGenerator.generate_rows`, `generate_rows_from`): a small drafter proposes 2 tokens, one
-verify pass checks them with the full model, and the accepted ones are kept. The tokens are the same as plain greedy
-decode. Nothing turns it on: the demo, the server and the perf harness run the plain step. It needs the drafter
-weights: `python -m models.demos.inkling2_mini.convert.mtp` writes them once to `<cache dir>/mtp`, where both run
-modes find them (`$INKLING_MTP_CACHE` points elsewhere).
+A small drafter proposes 2 tokens, one verify pass checks them with the full model, and the accepted ones are kept.
+The tokens are the same as plain greedy decode; text the drafter predicts well comes out faster.
 
-Measured on one card, ms/token, 128 to 192 greedy tokens, plain = the default plain step in the same harness:
+| where | how |
+|---|---|
+| chat server | `--spec` or `INKLING_SPEC=1`: greedy requests (`temperature` 0). Sampled requests run the plain step |
+| demo | `--spec` or `INKLING_SPEC=1`: each prompt also runs through spec decode; prints `spec_equals_plain`, tok/s |
+| code | `tt/spec_generator.py`: `SpecGenerator.generate_rows`, `generate_rows_from` |
 
-| run | plain | spec | tokens / pass |
-|---|---|---|---|
-| 4K, code prompt, default mode | 15.15 | 13.29 | 2.23 |
-| 4K, prose prompt, default mode | 15.15 | 12.10 | 2.35 |
-| 4K, code prompt, fast mode | 13.68 | 13.20 | 1.76 |
-| 4K, prose prompt, fast mode | 13.68 | 10.62 | 2.40 |
-| 130K real prompt, prefill feeds the drafter, default mode | 20.65 | 16.92 | 1.91 |
-| 130K real prompt, prefill feeds the drafter, fast mode | 19.02 | 17.84 | 1.68 |
-| 130K real prompt, prefill without the drafter feed, default mode | 20.52 | 22.01 | 1.44 |
+It needs the drafter weights: `python -m models.demos.inkling2_mini.convert.mtp` writes them once to
+`<cache dir>/mtp`, where both run modes find them (`$INKLING_MTP_CACHE` points elsewhere).
 
-A chunked prefill gives the drafter no context for the prompt unless it is told to: set
-`Inkling2Prefill.drafter = <the DSparkDrafter>` before `prefill()` and every chunk also writes the drafter's context
-(`DSparkDrafter.commit_chunk`). Without it fewer drafts are accepted (4K prompts: 1.7 to 1.9 tokens per pass and
-15.3 to 16.4 ms/token); with it they are accepted as after decode.
+Served tok/s (the server's `timings`, one card, greedy, replies equal to the plain server's in every row):
 
-The 130K rows: the prompt prefilled once (model state and drafter context saved), then decode in a process on the
-decode (PF) cache. A process that does both, prefill and spec decode, has to load the TILE cache; the tokens are
-the same as plain there too, but its expert step runs a verify pass row by row and its plain step is slower
-(20.5 ms/token at 4K), so spec gains nothing in that process today. Spec decode also runs without the expert
-prefetch (the drafter's programs and the prefetch ring do not fit in L1 together).
+| request | default | default `--spec` | fast | fast `--spec` |
+|---|---:|---:|---:|---:|
+| 4K: one-sentence answer, 58 tokens | 66.9 | 85.9 | 75.0 | 94.7 |
+| 4K: Python function, 300 tokens | 68.5 | 78.7 | 76.9 | 89.6 |
+| 4K: short story, 300 tokens | 68.6 | 64.4 | 76.9 | 73.5 |
+| 4K: short story with reasoning, 300 tokens | 68.4 | 66.0 | 76.9 | 74.3 |
+| 4K: sampled (T 0.8), 200 tokens | 63.3 | 62.0 | 70.3 | 69.0 |
+| 4K: prompt feed | 68.1 | 64.7 | 76.2 | 72.8 |
+| 128K context: continue the text, 192 tokens | 49.8 | 58.2 | 54.1 | 56.4 |
+| 128K context: question about the text, 48 tokens | 50.5 | 62.7 to 72.1 | 54.9 | 80.0 to 80.3 |
+
+- With `--spec` every step also keeps the drafter's context up to date and the expert prefetch is off (it does not
+  fit in L1 beside the drafter), so the plain step is ~5 % slower: the prompt feed, sampled requests and text the
+  drafter can not predict (the story) lose that much. When drafts stop paying off the server runs plain steps for a
+  while and tries again.
+- A thinking budget turns spec off until the budget is used (the forced tokens must follow an exact token).
+- DRAM: the drafter context takes 12,288 B per token of `--max-ctx` beside the far KV's 19,584. 3-row passes fit up
+  to about 142K tokens in default mode (276K in fast mode), 2-row passes to about 151K (286K); the server picks
+  the rows at start and refuses `--spec` above that.
+
+A chunked prefill (`tt/prefill_model.py`; the server does not use it) gives the drafter no context for the prompt
+unless it is told to: set `Inkling2Prefill.drafter = <the DSparkDrafter>` before `prefill()` and every chunk also
+writes the drafter's context (`DSparkDrafter.commit_chunk`). A process that runs that prefill has to load the TILE
+cache; spec tokens equal plain there too, but its expert step runs a verify pass row by row, so spec gains nothing
+in that process today.
 
 ## Convert the weights
 
@@ -136,7 +148,7 @@ model's reasoning comes as `reasoning_content`.
 
 ```
 python -m models.demos.inkling2_mini.server.fetch_ui       # once: Llama Chat (MIT), pinned and sha256-checked
-python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT --max-ctx 16384 [--fast]
+python -m models.demos.inkling2_mini.server --ckpt $INKLING_CKPT --max-ctx 16384 [--fast] [--spec]
 ```
 
 Then open http://127.0.0.1:8080/ once the log says the traces are captured (the UI waits while the model
