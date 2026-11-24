@@ -252,3 +252,44 @@ def test_greedy_thinking_budget_and_limits(srv):
         assert r["choices"][0]["finish_reason"] == "length" and r["usage"]["completion_tokens"] == n
     r = json.loads(post(base + "/v1/chat/completions", dict(body, stop=["stub"]))[1])
     assert r["choices"][0]["message"]["content"] == "Hello! I am a "
+
+
+def test_spec_engine(tok):
+    """The engine's speculative path on the stub runner (made-up drafts, some wrong, some passes declined): the same
+    replies, usage and next-turn reuse as the plain path; a thinking budget, token limits and a stop string too."""
+    from models.demos.inkling2_mini.server.chat import SpecialIds
+    from models.demos.inkling2_mini.server.engine import Engine
+    from models.demos.inkling2_mini.server.fake import EchoRunner
+    from models.demos.inkling2_mini.server.server import App, serve
+
+    def run(spec, bodies):
+        runner = EchoRunner(tok, max_ctx=512, spec=spec)
+        engine = Engine(lambda: runner, tok, SpecialIds(tok), log=lambda s: None).start()
+        engine.ready.wait(10)
+        httpd = serve(App(engine, tok), "127.0.0.1", 0)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        out = []
+        try:
+            for b in bodies:
+                r = json.loads(post(base + "/v1/chat/completions", b)[1])
+                m = r["choices"][0]
+                out.append((m["message"].get("reasoning_content"), m["message"]["content"], m["finish_reason"],
+                            r["usage"]["completion_tokens"], r["timings"].get("spec_passes", 0),
+                            r["timings"]["cache_n"], runner.resets))  # fmt: skip
+        finally:
+            httpd.shutdown()
+            engine.stop()
+        return out
+
+    body = {"messages": USER, "temperature": 0}
+    again = USER + [{"role": "assistant", "content": "Hello! I am a stub, not the model.",
+                     "reasoning_content": "The user says hello. I answer briefly."}] + USER  # fmt: skip
+    bodies = [body, {"messages": again, "temperature": 0}, dict(body, thinking_budget_tokens=2)]
+    bodies += [dict(body, max_tokens=n) for n in (1, 2, 3, 7)] + [dict(body, stop=["stub"])]
+    plain, spec = run(False, bodies), run(True, bodies)
+    assert [p[:4] for p in plain] == [s[:4] for s in spec]
+    assert all(p[4] == 0 for p in plain) and spec[0][4] > 0 and spec[1][4] > 0
+    # the second turn reuses the first reply in both: no reset; the stop token is fed by the plain path's step
+    # ahead, and by a pass only when the drafter drafted it
+    assert spec[1][5] in (plain[1][5] - 1, plain[1][5]) and spec[1][6] == spec[0][6]

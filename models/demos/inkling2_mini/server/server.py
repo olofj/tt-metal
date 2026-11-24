@@ -393,6 +393,15 @@ def main(argv=None):
     ap.add_argument("--ui-dir", default=None, help="Llama Chat static files (fetch_ui.py prints the path)")
     ap.add_argument("--fake", action="store_true", help="no card: a stub model that echoes (HTTP layer tests)")
     ap.add_argument("--exact-cache", action="store_true", help="load --cache as given, not its PF-layout twin")
+    ap.add_argument(
+        "--spec",
+        action="store_true",
+        default=os.environ.get("INKLING_SPEC") == "1",
+        help="speculative decode for greedy requests (also INKLING_SPEC=1): a small drafter proposes 2 tokens, one "
+        "verify pass checks them; the same tokens as without it, more tokens per second on text the drafter "
+        "predicts. Sampled requests run the plain step. Needs --max-ctx >= 4096 and the drafter weights "
+        "(convert.mtp); off by default",
+    )
     a = ap.parse_args(argv)
     if a.ckpt is None:
         ap.error("--ckpt or INKLING_CKPT is required (the tokenizer and chat template)")
@@ -412,12 +421,14 @@ def main(argv=None):
     if a.fake:
         from models.demos.inkling2_mini.server.fake import EchoRunner
 
-        make = lambda: EchoRunner(tok, a.max_ctx)  # noqa: E731
+        make = lambda: EchoRunner(tok, a.max_ctx, spec=a.spec)  # noqa: E731
     else:
         from models.demos.inkling2_mini.server.engine import TTRunner
 
         cache = a.cache if a.exact_cache else pf_cache(a.cache, log)
-        make = lambda: TTRunner(cache, a.max_ctx, log=log)  # noqa: E731
+        early = os.environ.get("INKLING_SPEC_EARLY", "auto")  # tuning: "auto", "t1,t2" thresholds, or "none"
+        early = None if early == "none" else early if early == "auto" else tuple(float(x) for x in early.split(","))
+        make = lambda: TTRunner(cache, a.max_ctx, log=log, spec=a.spec, spec_early=early)  # noqa: E731
     engine = Engine(make, tok, special, log=log)
     tmpl = Path(a.ckpt, "chat_template.jinja")
     app = App(
