@@ -75,8 +75,8 @@ class TTRunner:
     # each pass books (its tokens) - (its cost); while the sum is below minus that allowance the request runs plain
     # steps (they raise the allowance, so drafting is tried again later, ever more rarely on text the drafter can
     # not predict).
-    SPEC_COST = (0.29, 0.70, 0.99)
-    SPEC_DEBT = (1.3, 0.004)
+    SPEC_COST = (0.35, 0.75, 1.05)
+    SPEC_DEBT = (0.7, 0.002)
     SPEC_PRIOR = (6.0, 1.0, 0.95)
 
     @staticmethod
@@ -265,8 +265,9 @@ class TTRunner:
         self._hit, self._exp = self.SPEC_PRIOR[0] * self.SPEC_PRIOR[2 if sampled else 1], self.SPEC_PRIOR[0]
 
     def spec_ready(self):
-        if os.environ.get("INKLING_SPEC_GATE") == "0":  # tuning: never turn drafting off
-            return True
+        gate = os.environ.get("INKLING_SPEC_GATE")  # tuning: "0" never turns drafting off, "off" never drafts
+        if gate in ("0", "off"):
+            return gate == "0"
         return self._bal >= -(self.SPEC_DEBT[0] + self.SPEC_DEBT[1] * self._steps)
 
     def _acc(self, p):
@@ -294,12 +295,13 @@ class TTRunner:
             if not run:
                 self._flush()
             elif self._pending == 0:
-                self._stash = ph == 0
+                self._stash = pos % len(self.gen.strace) == 0
                 if self._stash:
                     self.drafter.set_stash_pos(pos)
             if self._stash:
-                tr, outs = self.gen.strace, self.gen.sout
-                self._pending = (ph + 1) % len(tr)  # the last slot's step commits the group
+                slot = pos % len(self.gen.strace)
+                tr, outs = self.gen.strace[slot - ph :], self.gen.sout[slot - ph :]  # [ph] = this slot's step
+                self._pending = (slot + 1) % len(self.gen.strace)  # the last slot's step commits the group
         if token is not None:
             t = ttnn.from_torch(torch.tensor([[token]], dtype=torch.int32), dtype=ttnn.uint32)
             ttnn.copy_host_to_device_tensor(t, m.tokens)
