@@ -40,6 +40,8 @@ class Generator:
         self.out = None  # [phase] -> output dict
         self.overlap = None  # tt/mk/overlap.Overlap while installed (capture .. release)
         self.router_stage = None  # tt/mk/router_stage.RouterStage, same lifetime
+        self.suspended = False  # between suspend() and a resume() that returned True
+        self._pads = []  # L1 tensors that keep the room of what suspend() freed and resume() did not take again
 
     def capture(self):
         """Compile eagerly once (program cache), then capture one full decode step per conv phase."""
@@ -119,11 +121,74 @@ class Generator:
         ttnn.execute_trace(self.device, self.trace[ph], cq_id=0, blocking=False)
         return self.out[ph]
 
+    # A chunked prefill with the traces kept. Its programs need the L1 of the staging, the expert prefetch ring
+    # and the expert steps' output rows, and a trace carries the L1 addresses it was captured with. So:
+    #     gen.suspend(); prefill; if not gen.resume(): gen.release(); gen.begin_live() (as above)
+    # suspend() frees that L1 between two steps (the queued expert request is taken, the prefetcher stopped).
+    # resume() takes the same L1 ranges again, puts back what the staging tensors hold at a step boundary and
+    # starts the prefetcher: the next replay then runs as any step does. The freed rows are not needed again (a
+    # replay writes each before it reads it); a pad tensor holds their room, so that the allocator, which hands
+    # out the highest free range, finds the same addresses. False: an address did not come back (nothing ran).
+    def suspend(self):
+        assert self.trace is not None and not self.live and not self.suspended
+        for part in (self.experts, self.router_stage, self.overlap):  # (the experts' last step still uses the hooks)
+            if part is not None:
+                part.suspend(*((self.model,) if part is self.experts else ()))
+        self._free_rows()
+        for t in self._pads:
+            ttnn.deallocate(t)
+        self._pads = []
+        self.suspended = True
+
+    def resume(self):
+        for part in (self.overlap, self.experts, self.router_stage):  # the order install took them in
+            if part is not None and not part.resume(self._retake):
+                return False
+        self.suspended = False
+        return True
+
+    def _retake(self, make, address_of, free, want):
+        """make() until its L1 allocation is at `want` (an address, or a tuple with the highest range first): as it
+        comes, or below a pad as large as the miss. None: neither."""
+        first = lambda a: a[0] if isinstance(a, tuple) else a  # noqa: E731
+        for attempt in range(2):
+            obj = make()
+            got = address_of(obj)
+            if got == want:
+                return obj
+            free(obj)
+            miss = first(got) - first(want)
+            if attempt or miss <= 0 or miss % 16:
+                return None
+            one = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))})
+            mem = ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(one, (1, miss // 4), ttnn.ShardOrientation.ROW_MAJOR),
+            )  # (one core's shard: the L1 allocator takes the range on every core)
+            self._pads.append(
+                ttnn.allocate_tensor_on_device(
+                    ttnn.Shape([1, 1, 1, miss // 4]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, self.device, mem
+                )
+            )
+
+    def _free_rows(self):
+        """The expert steps' last output rows (L1, one per layer; no step reads one before it writes it)."""
+        for lay in self.model.layers:
+            for name in ("release_last", "release_rows"):
+                free = getattr(getattr(lay.moe, "fused", None), name, None)
+                if free is not None:
+                    free()
+
     def release(self):
         for t in self.trace or []:
             if t is not None:
                 ttnn.release_trace(self.device, t)
         self.trace = None
+        self.suspended = False
+        for t in self._pads:
+            ttnn.deallocate(t)
+        self._pads = []
         if self.router_stage is not None:
             self.router_stage.uninstall()
             self.router_stage = None
@@ -133,12 +198,7 @@ class Generator:
         if self.overlap is not None:
             self.overlap.uninstall(self.model)
             self.overlap = self.model.overlap = None
-        # the expert steps' last output rows (L1, one per layer): no trace writes them any more, and a chunked
-        # prefill needs their L1
-        for lay in self.model.layers:
-            free = getattr(getattr(lay.moe, "fused", None), "release_last", None)
-            if free is not None:
-                free()
+        self._free_rows()  # no trace writes them any more, and a chunked prefill needs their L1
 
     def decode(self, token, pos, traced=True):
         """One step. Returns device result dict (logits, token)."""
