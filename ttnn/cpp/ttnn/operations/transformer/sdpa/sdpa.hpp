@@ -54,7 +54,11 @@ ttnn::Tensor scaled_dot_product_attention(
     /// rel_logits only: position of query row 0 among the keys (default Sk - Sq). A runtime argument, so one
     /// program serves every offset: with K/V padded past the last query, the keys after it are masked as d < 0
     /// and the K chunks past it are not read. A multiple of 32, offset + Sq <= Sk.
-    std::optional<uint32_t> rel_q_offset = std::nullopt);
+    std::optional<uint32_t> rel_q_offset = std::nullopt,
+    /// rel_logits only: the same offset read on the device from a 1-element uint32 ROW_MAJOR DRAM tensor (instead
+    /// of rel_q_offset), so a captured trace serves every offset the host writes there before a replay. Not
+    /// validated on the host.
+    const std::optional<ttnn::Tensor>& rel_q_offset_tensor = std::nullopt);
 
 /// Chunked SDPA over paged K/V: one Q chunk per call, K/V in paged layout.
 /// Two overloads: legacy (chunk_start_idx as int) or flexible (chunk_start_idx_tensor on device).

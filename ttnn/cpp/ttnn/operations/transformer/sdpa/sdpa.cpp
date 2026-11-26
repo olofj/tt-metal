@@ -51,7 +51,8 @@ ttnn::Tensor scaled_dot_product_attention(
     const std::optional<ttnn::Tensor>& attn_mask_block_map,
     const std::optional<ttnn::Tensor>& rel_logits,
     bool rel_skewed,
-    std::optional<uint32_t> rel_q_offset) {
+    std::optional<uint32_t> rel_q_offset,
+    const std::optional<ttnn::Tensor>& rel_q_offset_tensor) {
     auto kernel_config_val = init_device_compute_kernel_config(
         input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
@@ -113,7 +114,8 @@ ttnn::Tensor scaled_dot_product_attention(
         attn_mask_block_map,
         effective_rel,
         rel_skewed,
-        rel_q_offset);
+        rel_q_offset,
+        rel_q_offset_tensor);
 }
 
 // Legacy: chunk_start_idx as scalar (part of program cache key).

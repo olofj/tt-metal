@@ -61,6 +61,8 @@ struct SDPAInputs {
     // Banded relative bias [B, NQH, Sq, W] bf16 ROW_MAJOR: rel_logits[b, h, i, d] is added to the logit of
     // query row i and the key at distance d = (i + Sk - Sq) - j, for 0 <= d < W. The reader builds the mask.
     std::optional<Tensor> rel_logits;
+    // rel_logits: query row 0's position read on the device (1-element uint32 ROW_MAJOR), instead of rel_q_offset
+    std::optional<Tensor> rel_q_offset_tensor;
 };
 
 }  // namespace ttnn::prim

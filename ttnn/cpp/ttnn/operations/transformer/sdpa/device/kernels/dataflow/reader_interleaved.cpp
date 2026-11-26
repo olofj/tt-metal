@@ -464,7 +464,11 @@ void kernel_main() {
     }
 #ifdef SDPA_REL_BIAS
     const uint32_t rel_addr = get_arg_val<uint32_t>(argidx++);
+#ifdef SDPA_REL_QOFF_DEV
+    const uint32_t rel_qoff_addr = get_arg_val<uint32_t>(argidx++);  // read below, once the CB ids are known
+#else
     kRelQOff = get_arg_val<uint32_t>(argidx++);
+#endif
 #endif
 
     // When chunked: only process K/V up to (chunk_start_idx + Q_chunk_length) tokens.
@@ -506,6 +510,9 @@ void kernel_main() {
 #endif
 
     constexpr uint32_t q_tile_bytes = get_tile_size(cb_q_in);
+#if defined(SDPA_REL_BIAS) && defined(SDPA_REL_QOFF_DEV)
+    kRelQOff = rel_qoff_read(rel_qoff_addr, get_write_ptr(cb_q_in));  // cb_q_in: produced here, still empty
+#endif
     constexpr uint32_t k_tile_bytes = get_tile_size(cb_k_in);
     constexpr uint32_t v_tile_bytes = get_tile_size(cb_v_in);
     constexpr uint32_t mask_tile_bytes = use_provided_mask ? get_tile_size(cb_mask_in) : 0;
@@ -849,6 +856,7 @@ void kernel_main() {
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb_k_range.get_write_ptr());
                 k_range_ptr[0] = windowed_k_lo;
                 k_range_ptr[1] = windowed_k_hi;
+                k_range_ptr[2] = kRelQOff;  // compute's offset with SDPA_REL_QOFF_DEV
                 cb_k_range.push_back(1);
             }
 

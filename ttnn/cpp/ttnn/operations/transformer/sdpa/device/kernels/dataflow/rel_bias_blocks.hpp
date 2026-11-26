@@ -18,6 +18,18 @@ constexpr uint32_t kRelW = SDPA_REL_W;
 inline uint32_t kRelQOff = 0;
 constexpr uint32_t kRelRowBytes = SDPA_REL_ROW_BYTES;
 
+#ifdef SDPA_REL_QOFF_DEV
+// The offset from DRAM (rel_q_offset_tensor: uint32 ROW_MAJOR, first value), into l1 (a 64 B aligned CB page this
+// RISC produces and has not reserved yet). Invalidate: the address is the same every replay.
+inline uint32_t rel_qoff_read(uint32_t addr, uint32_t l1) {
+    const InterleavedAddrGen<true> g = {.bank_base_address = addr, .page_size = 64};
+    noc_async_read(g.get_noc_addr(0), l1, 64);
+    noc_async_read_barrier();
+    invalidate_l1_cache();
+    return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1);
+}
+#endif
+
 #ifdef SDPA_REL_TILIZE
 // row[c] = v for c in [c0, c1) of a 4 B aligned bf16 row: 32-bit stores, a 16-bit store at an odd edge.
 FORCE_INLINE void rel_fill_run(tt_l1_ptr uint16_t* row, int32_t c0, int32_t c1, uint16_t v) {

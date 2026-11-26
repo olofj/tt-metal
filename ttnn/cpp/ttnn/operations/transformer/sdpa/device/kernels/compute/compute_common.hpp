@@ -1839,6 +1839,9 @@ void sdpa_inner_loop(
             cb_k_range_obj.wait_front(1);
             k_chunk_start = ckernel::read_tile_value(cb_windowed_k_range, 0, 0);
             k_chunk_end = ckernel::read_tile_value(cb_windowed_k_range, 0, 1);
+#if defined(SDPA_REL_BIAS) && defined(SDPA_REL_QOFF_DEV)
+            sdpa_rel_q_off = ckernel::read_tile_value(cb_windowed_k_range, 0, 2);  // the reader's device offset
+#endif
             cb_k_range_obj.pop_front(1);
         }
 

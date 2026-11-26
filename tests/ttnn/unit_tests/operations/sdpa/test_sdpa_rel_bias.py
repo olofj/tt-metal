@@ -170,3 +170,57 @@ def test_sdpa_kv_in_place(device, dtype, skewed):
     kc = ttnn.slice(kv, [0, 0, 0, dh], [1, nkh, rows, 2 * dh])
     vc = ttnn.slice(kv, [0, 0, 0, 0], [1, nkh, rows, dh])
     assert torch.equal(run(kc, vc), run(kv, kv, k_head_col=dh))
+
+
+@pytest.mark.parametrize("device_params", [{"trace_region_size": 4 << 20}], indirect=True)
+@pytest.mark.parametrize("skewed", [False, True], ids=["plain", "skewed"])
+def test_sdpa_rel_q_offset_tensor(device, skewed):
+    """rel_q_offset_tensor (the offset read on the device) equals rel_q_offset bit for bit, also from one captured
+    trace replayed after the host writes other offsets into the tensor."""
+    torch.manual_seed(3)
+    nh, nkh, dh, sq, sk = 4, 2, 128, 256, 4096
+    w = 1024 if skewed else 256
+    q = torch.randn(1, nh, sq, dh)
+    k = torch.randn(1, nkh, sk, dh)
+    v = torch.randn(1, nkh, sk, dh)
+    rel = torch.randn(1, nh, sq, w + (32 if skewed else 0)) * 2
+    sink = torch.randn(1, nh, sq, 1)
+    tt = lambda t, layout=ttnn.TILE_LAYOUT: ttnn.from_torch(  # noqa: E731
+        t, dtype=ttnn.bfloat16, layout=layout, device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    pc = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=device.compute_with_storage_grid_size(),
+        q_chunk_size=128,
+        k_chunk_size=128,
+        exp_approx_mode=False,
+    )
+    ckc = ttnn.init_device_compute_kernel_config(
+        device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
+    )
+    qt, kt, vt, rt, st = tt(q), tt(k), tt(v), tt(rel, ttnn.ROW_MAJOR_LAYOUT), tt(sink)
+    off_host = lambda o: ttnn.from_torch(  # noqa: E731
+        torch.full((1, 16), o, dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
+    )
+    off_dev = ttnn.from_torch(
+        torch.zeros(1, 16, dtype=torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=device
+    )
+
+    def run(**kw):
+        return ttnn.transformer.scaled_dot_product_attention(
+            qt, kt, vt, is_causal=True, scale=1.0, rel_logits=rt, rel_skewed=skewed, attention_sink=st,
+            program_config=pc, compute_kernel_config=ckc, **kw,
+        )  # fmt: skip
+
+    offs = (1152, 0, 3840, 2048)
+    want = [ttnn.to_torch(run(rel_q_offset=o)) for o in offs]
+    for o, ref in zip(offs, want):  # eager
+        ttnn.copy_host_to_device_tensor(off_host(o), off_dev)
+        assert torch.equal(ref, ttnn.to_torch(run(rel_q_offset_tensor=off_dev))), o
+    tid = ttnn.begin_trace_capture(device, cq_id=0)
+    out = run(rel_q_offset_tensor=off_dev)
+    ttnn.end_trace_capture(device, tid, cq_id=0)
+    for o, ref in zip(offs, want):  # one trace, the offset written before each replay
+        ttnn.copy_host_to_device_tensor(off_host(o), off_dev)
+        ttnn.execute_trace(device, tid, cq_id=0, blocking=True)
+        assert torch.equal(ref, ttnn.to_torch(out)), o
+    ttnn.release_trace(device, tid)

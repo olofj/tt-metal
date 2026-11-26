@@ -601,6 +601,17 @@ void SDPAOperation::validate_on_program_cache_miss(const SDPAParams& attrs, cons
         "attn_mask_block_map cannot be combined with cu_window_seqlens, sliding_window_size or chunked prefill");
 
     TT_FATAL(!attrs.rel_q_offset.has_value() || tensors.rel_logits.has_value(), "rel_q_offset needs rel_logits");
+    if (tensors.rel_q_offset_tensor.has_value()) {
+        const auto& qo = tensors.rel_q_offset_tensor.value();
+        TT_FATAL(
+            tensors.rel_logits.has_value() && !attrs.rel_q_offset.has_value(),
+            "rel_q_offset_tensor needs rel_logits and no rel_q_offset");
+        TT_FATAL(
+            qo.storage_type() == StorageType::DEVICE && qo.is_allocated() && qo.dtype() == DataType::UINT32 &&
+                qo.layout() == Layout::ROW_MAJOR && qo.memory_config().buffer_type() == BufferType::DRAM &&
+                !qo.is_sharded() && qo.logical_volume() >= 1,
+            "rel_q_offset_tensor must be a uint32 ROW_MAJOR interleaved DRAM tensor (its first value is the offset)");
+    }
     if (tensors.rel_logits.has_value()) {
         const auto& rel = tensors.rel_logits.value();
         const auto q_shape = q.logical_shape();
@@ -795,7 +806,8 @@ Tensor sdpa(
     const std::optional<Tensor>& attn_mask_block_map,
     const std::optional<Tensor>& rel_logits,
     bool rel_skewed,
-    std::optional<uint32_t> rel_q_offset) {
+    std::optional<uint32_t> rel_q_offset,
+    const std::optional<Tensor>& rel_q_offset_tensor) {
     using OperationType = ttnn::prim::SDPAOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
@@ -831,6 +843,7 @@ Tensor sdpa(
             .windowed_q_token_offset_tensor = windowed_q_token_offset_tensor,
             .attn_mask_block_map = attn_mask_block_map,
             .rel_logits = rel_logits,
+            .rel_q_offset_tensor = rel_q_offset_tensor,
         });
 }
 }  // namespace ttnn::prim

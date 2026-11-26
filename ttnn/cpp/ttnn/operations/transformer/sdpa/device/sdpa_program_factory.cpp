@@ -1743,6 +1743,9 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
         // (rel_q_offset, default Sk - Sq) is a runtime argument of the reader, the writer and compute.
         const auto& rel_shape = tensor_args.rel_logits->logical_shape();
         defines_map["SDPA_REL_BIAS"] = "1";
+        if (tensor_args.rel_q_offset_tensor.has_value()) {  // the offset read on the device (trace replays)
+            defines_map["SDPA_REL_QOFF_DEV"] = "1";
+        }
         const bool skewed = operation_attributes.rel_skewed;
         defines_map["SDPA_REL_W"] = std::to_string(rel_shape[3] - (skewed ? TILE_WIDTH : 0));
         if (skewed) {
@@ -2195,7 +2198,11 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
         }
         if (use_rel_bias) {
             reader_args.push_back(tensor_args.rel_logits->buffer());
-            reader_args.push_back(rel_q_off);
+            if (tensor_args.rel_q_offset_tensor.has_value()) {
+                reader_args.push_back(tensor_args.rel_q_offset_tensor->buffer());
+            } else {
+                reader_args.push_back(rel_q_off);
+            }
         }
 
         reader_desc.emplace_runtime_args(core, reader_args);
@@ -2222,7 +2229,11 @@ ProgramDescriptor SDPAOperation::SDPAProgramFactory::create_descriptor(
         }
         if (rel_in_writer) {  // runtime arg rel_writer_arg (13 + the chain tail above)
             writer_args.push_back(tensor_args.rel_logits->buffer());
-            writer_args.push_back(rel_q_off);  // rel_writer_arg + 1
+            if (tensor_args.rel_q_offset_tensor.has_value()) {  // rel_writer_arg + 1
+                writer_args.push_back(tensor_args.rel_q_offset_tensor->buffer());
+            } else {
+                writer_args.push_back(rel_q_off);
+            }
         }
         writer_desc.emplace_runtime_args(core, writer_args);
 
