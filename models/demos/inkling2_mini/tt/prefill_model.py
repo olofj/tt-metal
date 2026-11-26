@@ -74,6 +74,7 @@ from models.demos.inkling2_mini.tt.fused.common import (
 from models.demos.inkling2_mini.tt.fused.pf_attnres import PfAttnRes
 from models.demos.inkling2_mini.tt.fused.pf_combine import PfCombine
 from models.demos.inkling2_mini.tt.fused.pf_conv import PfConv
+from models.demos.inkling2_mini.tt.fused.pf_far import PfFar
 from models.demos.inkling2_mini.tt.fused.pf_gate import PfGateTail
 from models.demos.inkling2_mini.tt.fused.pf_gateout import PfGateOut
 from models.demos.inkling2_mini.tt.fused.pf_handoff import PfHandoff
@@ -108,6 +109,9 @@ _HAS_QOFF = "rel_q_offset" in (ttnn.transformer.scaled_dot_product_attention.__d
 # the cache rows [0, kb) per global layer (2 x 142 MB of DRAM at 128K, which a 196608 context with spec decode does not
 # have left), and one key shape for every start (older builds: the copies, kb in FAR_ROWS buckets)
 _KV_IN_PLACE = _HAS_QOFF and hasattr(ttnn.SDPAProgramConfig, "k_head_col")
+# the SDPA reads the query position from a device tensor (rel_q_offset_tensor): with the far write at a device row
+# (fused/pf_far.py) a pass from s >= 1024 (s % 1024 == 0) has no s in any program, so one trace serves every such s
+_HAS_QOFF_DEV = _KV_IN_PLACE and "rel_q_offset_tensor" in (ttnn.transformer.scaled_dot_product_attention.__doc__ or "")
 # rows kept from the end of the last chunk for the decode handoff: the last real row n - 1 lies in the last QB rows,
 # its lags 1..3 go back 3 more, and the conv tails put 32 rows in front: QB + 32 covers both
 KEEP = QB + 32
@@ -148,9 +152,18 @@ class _Tail:
     shared zero constant (never written: each window makes a new tail). keep: set on the last chunk; then
     window() stores the last KEEP rows of [old tail ++ chunk] there (the conv-history handoff)."""
 
-    def __init__(self, zero):
+    def __init__(self, zero, fix=None):
         self.t = zero
         self.keep = None
+        self.fix = fix  # dev_s: a fixed buffer the tail is copied into, so a trace reads it at one address
+
+    def advance(self, new):
+        """The tail is now `new` (copied into the fixed buffer when there is one)."""
+        if self.fix is None:
+            self.t = new
+        else:
+            ttnn.copy(new, self.fix)
+            self.t = self.fix
 
     def window(self, x):
         """x [1,1,T,W] bf16 -> (ext [1,1,32+T,W], lags[r] = input r steps back, r = 0..3) and advances the tail."""
@@ -160,7 +173,7 @@ class _Tail:
         lags = [x] + [_rows(ext, 32 - r, 32 - r + t) for r in range(1, TAPS)]
         if self.keep is not None:
             self.keep[0][self.keep[1]] = _rows(ext, t + 32 - KEEP, t + 32)
-        self.t = _rows(ext, t, t + 32)
+        self.advance(_rows(ext, t, t + 32))
         return ext, lags
 
 
@@ -556,6 +569,11 @@ class Inkling2Prefill:
         self._pfmsg = PfMessages(dev) if fused_glue else None
         self._pfhand = PfHandoff(dev) if fused_glue else None  # one-program decode handoff (bit-equal)
         self._pfring = PfRing(dev) if fused_glue else None  # long-chunk ring write: rows of the cast k / v
+        # opt-in (dev_s): the pass start as a device input (`spos`), so the traces of passes from s >= 1024 do not
+        # depend on s (one key for all of them); off: s in the programs, a trace per start
+        self.dev_s = False
+        self._fix = None  # dev_s: the fixed conv-tail buffers (enable_dev_s)
+        self._pffar = PfFar(dev) if _HAS_QOFF_DEV else None
         self._pfswiglu = PfSwiglu(dev) if fused_glue else None  # sparse experts: slices + softcapped SwiGLU in one
         self._pfheads = PfHeads(dev) if fused_heads else None
         self._pfgate = PfGateOut(dev) if fused_heads else None
@@ -952,7 +970,10 @@ class Inkling2Prefill:
             assert st.kv_full.dtype == k_c.dtype, "prefill: bfp4 far cache (FAR_DTYPE) not supported"
             assert st.v_full is None, "prefill: split far caches (FAR_SPLIT) not supported"
             row = [v_c, k_c] if FAR_UNIT else [v_c, _rows(self.c_mass[cdt], 0, t), k_c]
-            ttnn.fill_cache(st.kv_full, ttnn.concat(row, dim=-1), 0, update_idx=s)
+            if self._dev_far(s):  # the row from the device (one trace for every s)
+                self._pffar(ttnn.concat(row, dim=-1), st.kv_full, self._cur["spos"])
+            else:
+                ttnn.fill_cache(st.kv_full, ttnn.concat(row, dim=-1), 0, update_idx=s)
         if self.rel_bias_sdpa:
             attn = self._attention_r3(lp, qs, rel, sink, st, k_c, v_c, s, t)
         elif not is_global:
@@ -1005,7 +1026,7 @@ class Inkling2Prefill:
                     vv = ttnn.slice(st.kv_full, [0, 0, 0, 0], [1, N_KV, kb, HEAD_DIM])
                 if qt > t:  # pad query rows: they see keys past the chunk, their outputs are dropped
                     qs, rl, sink = (ttnn.pad(x, [(0, 0), (0, 0), (0, qt - t), (0, 0)], 0.0) for x in (qs, rl, sink))
-                qoff = {"rel_q_offset": s}
+                qoff = {"rel_q_offset_tensor": self._cur["spos"]} if self._dev_far(s) else {"rel_q_offset": s}
             else:
                 kv = ttnn.slice(st.kv_full, [0, 0, 0, 0], [1, N_KV, s + t, KV_MEM])
                 kk, vv = _cols(kv, V_MEM, KV_MEM), _cols(kv, 0, HEAD_DIM)
@@ -1042,6 +1063,15 @@ class Inkling2Prefill:
             **qoff,
         )
         return o if qt == t else _rows(o, 0, t)
+
+    def _dev_far(self, s):
+        """A pass from s whose programs do not depend on s (dev_s): s >= 1024 on a window start."""
+        return self.dev_s and self._pffar is not None and s >= WINDOW and s % WINDOW == 0
+
+    def _skey(self, s, t):
+        """The start's part of a trace key: s, or for a _dev_far pass its global SDPA's query rows (_far_q: fewer
+        within one pass of the far cache's end)."""
+        return ("far", self._far_q(s, t, self.m.max_ctx)[0]) if self._dev_far(s) else s
 
     @staticmethod
     def _far_q(s, t, rows):
@@ -1548,8 +1578,29 @@ class Inkling2Prefill:
         tails = {}
         widths = (("k", N_KV * HEAD_DIM), ("v", N_KV * HEAD_DIM), ("attn", HIDDEN), ("mlp", HIDDEN))
         for L, p in APPS:
-            tails[cache_index(L, p)] = {k: _Tail(self.c_ztail[w]) for k, w in widths}
+            c = cache_index(L, p)
+            fix = self._fix.get(c, {}) if self._fix and self.dev_s else {}
+            tails[c] = {k: _Tail(self.c_ztail[w], fix.get(k)) for k, w in widths}
         return {"tails": tails}
+
+    def enable_dev_s(self):
+        """Opt-in: the pass start as a device input (see dev_s) and the conv tails in fixed buffers, so one trace
+        serves the passes from every s >= 1024 on a window start (the last pass of a prompt runs eagerly). Call
+        before any decode capture (the fixed buffers must not sit where a decode replay writes)."""
+        if self._pffar is None:
+            raise RuntimeError("dev_s needs a ttnn build whose SDPA takes rel_q_offset_tensor")
+        widths = (("k", N_KV * HEAD_DIM), ("v", N_KV * HEAD_DIM), ("attn", HIDDEN), ("mlp", HIDDEN))
+        z = lambda w: self._put(torch.zeros(1, 1, 32, w), ttnn.bfloat16)  # noqa: E731
+        self._fix = {cache_index(L, p): {k: z(w) for k, w in widths} for L, p in APPS}
+        self.dev_s = True
+
+    def _fix_sync(self, ctx):
+        """dev_s: every conv tail in its fixed buffer (a new or a continued prompt's tails are other tensors)."""
+        for d in ctx["tails"].values():
+            for v in d.values():
+                if isinstance(v, _Tail) and v.fix is not None and v.t is not v.fix:
+                    ttnn.copy(v.t, v.fix)
+                    v.t = v.fix
 
     def _state_ctx(self, s):
         """_new_ctx for a prompt that goes on from position s > 0: each application's conv tails hold its stream at
@@ -1601,6 +1652,8 @@ class Inkling2Prefill:
             ],
             "bi": put(i32(1, TOP_K * t), ttnn.uint32, rm),
         }
+        if self._pffar is not None:  # the pass start (dev_s)
+            b["spos"] = put(i32(1, 16), ttnn.uint32, rm)
         if self._pfroute is not None:
             b["nreal"] = put(i32(1, 16), ttnn.uint32, rm)
             b["hist"] = self._pfroute.hist_buffer(t, NUM_EXPERTS)
@@ -1664,6 +1717,8 @@ class Inkling2Prefill:
         if stale("tau", s):
             tau = torch.tensor([log_scale(p) for p in range(s, s + t)], dtype=torch.float32).view(1, 1, t, 1)
             self._write(b["tau"], tau, ttnn.float32, ttnn.TILE_LAYOUT)
+        if "spos" in b and stale("spos", s):
+            self._write(b["spos"], torch.tensor([[s] + [0] * 15], dtype=torch.int32), ttnn.uint32)
         if "nreal" in b and stale("nreal", n):
             self._write(b["nreal"], torch.tensor([[n] + [0] * 15], dtype=torch.int32), ttnn.uint32)
         if n < t and stale("valid", n):
@@ -1847,10 +1902,12 @@ class Inkling2Prefill:
         tails = {c: {k: (v.t if isinstance(v, _Tail) else v) for k, v in d.items()} for c, d in ctx["tails"].items()}
         return {"tails": tails, "ext": ctx.get("ext")}
 
-    @staticmethod
-    def _restore(ctx, snap):
+    def _restore(self, ctx, snap):
         names = ("k", "v", "attn", "mlp")
-        ctx["tails"] = {c: {k: (_Tail(v) if k in names else v) for k, v in d.items()} for c, d in snap["tails"].items()}
+        fix = lambda c, k: self._fix[c][k] if self._fix and self.dev_s else None  # noqa: E731
+        ctx["tails"] = {
+            c: {k: (_Tail(v, fix(c, k)) if k in names else v) for k, v in d.items()} for c, d in snap["tails"].items()
+        }
         if snap["ext"] is not None:
             ctx["ext"] = snap["ext"]
 
@@ -1950,6 +2007,11 @@ class Inkling2Prefill:
             self.release_traces()  # something was allocated since the last prefill call
         # no m.reset(): it zeroes the conv histories (x_hist, conv rings), and _handoff rewrites every one of them
         ctx = self._state_ctx(start) if start else self._new_ctx()
+        if self.dev_s:  # rewrite every input (a decode replay may have written where the buffers sit) and move the
+            # conv tails into their fixed buffers
+            for b in self._in.values():
+                b.pop("held", None)
+            self._fix_sync(ctx)
         ctx["L"] = L
         outs = []
         s = start
@@ -1969,11 +2031,11 @@ class Inkling2Prefill:
                         tails[name].keep = (ctx["ext"][c], name)
             self._set_inputs(chunk_ids, s, n)
             feed = self.drafter is not None
-            key = (chunk, t, s, last, n < t, feed)
+            key = (chunk, t, self._skey(s, t), last, n < t, feed)
             eager = False
             if traced and key in self._traces:
                 x = self._replay(self._traces[key], ctx, n)
-            elif traced and key in self._warm:
+            elif traced and key in self._warm and (not self.dev_s or (self._dev_far(s) and not last)):
                 x = self._capture(key, chunk_ids, s, n, ctx, bool(rows) or feed)
             else:
                 col = [] if collect is not None else None

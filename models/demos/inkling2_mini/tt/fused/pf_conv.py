@@ -115,5 +115,5 @@ class PfConv:
             keep[0][keep[1]] = (
                 ttnn.concat([tail.t, x], dim=2) if t + 32 <= 160 else ttnn.slice(x, [0, 0, t - 160, 0], [1, 1, t, c])
             )
-        tail.t = ttnn.slice(x, [0, 0, t - 32, 0], [1, 1, t, c])
+        tail.advance(ttnn.slice(x, [0, 0, t - 32, 0], [1, 1, t, c]))
         return out

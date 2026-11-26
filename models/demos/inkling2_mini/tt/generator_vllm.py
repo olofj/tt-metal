@@ -188,6 +188,8 @@ class Inkling2ForCausalLM:
         one = chunk == self.PF_CHUNKS[0] and spare_one >= 0 and not os.environ.get("INKLING_VLLM_PREFILL_PASS")
         pf = Inkling2Prefill(self.model, root=cache, chunk=-(-self.PF_ONE // 1024) * 1024 if one else chunk)
         pf.drafter = getattr(self, "drafter", None)  # (the speculative class: the prompt's drafter context too)
+        if os.environ.get("INKLING_VLLM_PREFILL_TRACE", "0") != "0":  # opt-in: replay one trace for the passes from
+            pf.enable_dev_s()  # s >= 1024 and keep it across requests (before the decode capture: fixed buffers)
         logger.info(
             f"chunked prefill on for prompts of {self.pf_min}+ tokens: passes of {chunk}"
             f"{f', one pass up to {self.PF_ONE}' if one else ''}; built in {time.time() - t0:.0f} s"
@@ -487,7 +489,8 @@ class Inkling2ForCausalLM:
         one = len(ids) - start <= self.PF_ONE and self.pf.chunk > self.pf_chunk
         chunk = self.pf.chunk if one else self.pf_chunk
         self._pf_logits = self.pf.prefill(ids[start:], chunk=chunk, start=start)[0].float()
-        self.pf.drop_buffers()  # (nothing of the prefill stays where a decode replay writes)
+        if not self.pf.dev_s:  # (nothing of the prefill stays where a decode replay writes)
+            self.pf.drop_buffers()  # dev_s: its traces and buffers stay; every prefill rewrites what they read
         t2 = time.perf_counter()
         kept = self.gen.resume()
         if not kept:
@@ -503,7 +506,7 @@ class Inkling2ForCausalLM:
         self._out, self._pos_ready = None, None
         return (
             f"prefilled in chunks (decode L1 freed in {t1 - t0:.2f} s, prefill {t2 - t1:.2f} s with "
-            f"{self.pf.n_rebuilt} expert rebuilds; decode traces "
+            f"{self.pf.n_rebuilt} expert rebuilds, {len(self.pf._traces)} prefill traces kept; decode traces "
             f"{'kept' if kept else 'released, the next steps capture them again'})"
         )
 

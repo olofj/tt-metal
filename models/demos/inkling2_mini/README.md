@@ -329,6 +329,12 @@ Longer prompts, the default launch (speculative, 196608, passes of 1024), warm:
 | 130,872 tokens | 88.9 s | 1,470 tok/s | 76.4 tok/s |
 | 196,208 tokens, the 130,872 above on the card: 65,305 new from position 130,944 | 101.8 s (its first run: kernels compiled) | 650 tok/s | 46.2 tok/s (speculative decode stops at 143360) |
 
+`INKLING_VLLM_PREFILL_TRACE=1` (opt-in): the passes from position 1024 on replay one captured trace (23.7 MiB of
+the trace region for passes of 1024), kept across requests: the pass start is a device input, the far-cache
+write and the global SDPA read it on the card (`tt/fused/pf_far.py`, SDPA `rel_q_offset_tensor`), and the conv
+tails sit in fixed buffers. The first and last pass of a prompt still run eagerly. Same tokens as without it.
+Default launch, warm, first token: 8,424 tokens 5.7 s (7.0 without), 65,336 33.6 s (45.2), 130,872 76.0 s (88.9).
+
 A conversation that goes on (8,192-token prompt, 24-token replies, `--max-model-len 196608`), first token:
 
 | launch | + 4,096-token paste | then + 8,192-token paste | fed token by token |
